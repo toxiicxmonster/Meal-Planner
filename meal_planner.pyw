@@ -7,9 +7,13 @@ Pages:
 
 Data is saved to meal_data.json next to this file; photos are cached in image_cache/ and
 TheMealDB's full recipe list is kept in recipe_catalog.json (refreshed weekly).
+
+Sync: favorites, plans and settings can sync with the phone app (docs/, served by GitHub Pages)
+through a data.json file in a private GitHub repo. Connection details live in sync_config.json.
 Requires Pillow for photos:  python -m pip install pillow
 """
 
+import base64
 import datetime
 import hashlib
 import io
@@ -19,6 +23,7 @@ import random
 import re
 import threading
 import time
+import uuid
 import tkinter as tk
 import urllib.error
 import urllib.parse
@@ -77,6 +82,14 @@ REGIONS = {
     "Oceanian": ["Australian"],
 }
 ALL_CUISINES = "All cuisines"
+SYNC_FILE = HERE / "sync_config.json"
+PHONE_APP_URL = "https://toxiicxmonster.github.io/Meal-Planner/"
+GITHUB_API = "https://api.github.com"
+SYNC_PATH = "data.json"
+SYNC_EVERY_MS = 60_000
+PLAN_KEYS = ("week_start", "week", "kept", "sides")
+SETTINGS_KEYS = ("source", "filters")
+SLIM_KEYS = ("id", "uid", "name", "thumb", "category", "area", "types", "origin", "url", "youtube", "notes")
 PHONE_LINK_APP = r"shell:AppsFolder\Microsoft.YourPhone_8wekyb3d8bbwe!App"
 USER_AGENT = {"User-Agent": "Mozilla/5.0 (MealPlanner)"}
 
@@ -140,13 +153,169 @@ def load_data():
             w[key] = (datetime.date.fromisoformat(w[key]) + datetime.timedelta(days=5)).isoformat()
     data["week_layout"] = "sat-fri"
     data.setdefault("week_start", week_start_of(datetime.date.today()).isoformat())
+    data.setdefault("tombstones", {})  # uid -> when a favorite was deleted (so deletes sync)
+    data.setdefault("plan_updated", 0)
+    data.setdefault("shopping", [])
+    data.setdefault("settings_updated", 0)
     return data
+
+
+# ---------------------------------------------------------------- sync (shared rules with docs/core.js)
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def slim_meal(m):
+    """Plans only keep what's needed to show a meal; full recipes come from the catalog or favorites."""
+    return {k: m[k] for k in SLIM_KEYS if m.get(k)} if m else None
+
+
+def canonical(data):
+    return json.dumps(data, sort_keys=True, ensure_ascii=False)
+
+
+def merge_data(local, remote):
+    """Combine two copies of the planner data. Must match mergeData() in docs/core.js.
+    Favorites merge one by one (newest edit wins, deletions stick); the week plan and the
+    settings each go to whichever side changed them last; past weeks are combined."""
+    if not remote:
+        return json.loads(json.dumps(local))
+    out = json.loads(json.dumps(local))
+    tombs = dict(remote.get("tombstones") or {})
+    for uid, ts in (local.get("tombstones") or {}).items():
+        tombs[uid] = max(ts, tombs.get(uid, 0))
+    def newest(key):
+        items = {}
+        for f in (remote.get(key) or []) + (local.get(key) or []):
+            cur = items.get(f["uid"])
+            if cur is None or f.get("updated", 0) >= cur.get("updated", 0):
+                items[f["uid"]] = f
+        return [f for f in items.values() if tombs.get(f["uid"], -1) < f.get("updated", 0)]
+
+    by_added = lambda f: (f.get("added", 0), f["uid"])
+    alive = newest("favorites")
+    by_name = {}
+    for f in sorted(alive, key=lambda f: (-f.get("updated", 0), f["uid"])):
+        key = f["name"].strip().lower()
+        if key in by_name:  # the same meal was added on both devices: keep the newest copy
+            tombs[f["uid"]] = max(tombs.get(f["uid"], 0), f.get("updated", 0))
+        else:
+            by_name[key] = f
+    out["favorites"] = json.loads(json.dumps(sorted(by_name.values(), key=by_added)))
+    out["shopping"] = json.loads(json.dumps(sorted(newest("shopping"), key=by_added)))
+    out["tombstones"] = tombs
+    for keys, stamp in ((PLAN_KEYS, "plan_updated"), (SETTINGS_KEYS, "settings_updated")):
+        if remote.get(stamp, 0) > local.get(stamp, 0):
+            for k in keys:
+                if k in remote:
+                    out[k] = remote[k]
+            out[stamp] = remote[stamp]
+    history = {h["start"]: h for h in (remote.get("history") or []) + (local.get("history") or [])}
+    out["history"] = [history[k] for k in sorted(history)][-12:]
+    return out
+
+
+class SyncError(Exception):
+    pass
+
+
+class SyncConflict(SyncError):
+    pass
+
+
+class GitHubStore:
+    """Reads and writes data.json in a private GitHub repo."""
+
+    def __init__(self, repo, token, api=GITHUB_API):
+        self.repo, self.token, self.api = repo.strip().strip("/"), token.strip(), api
+
+    def _request(self, method, path, body=None):
+        req = urllib.request.Request(
+            f"{self.api}/repos/{self.repo}{path}", method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={"Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
+                     "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "MealPlanner",
+                     "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                raise SyncError("GitHub didn't accept the token. Check it was copied fully and hasn't expired.")
+            if e.code in (409, 422) and method == "PUT":
+                raise SyncConflict("The phone saved at the same moment \u2014 trying again.")
+            if e.code == 404:
+                raise
+            if e.code == 403:
+                raise SyncError("The token isn't allowed to change this repo. Give it Contents: Read and write.")
+            raise SyncError(f"GitHub error {e.code}")
+        except urllib.error.URLError:
+            raise SyncError("Couldn't reach GitHub \u2014 check your internet connection.")
+
+    def check(self):
+        try:
+            info = self._request("GET", "")
+        except urllib.error.HTTPError:
+            raise SyncError(f"Couldn't find the repo \u201c{self.repo}\u201d, or the token can't access it.")
+        if not info.get("private"):
+            raise SyncError("That repo is public, so anyone could see your meals. Make it private first "
+                            "(repo Settings \u2192 Danger Zone \u2192 Change visibility).")
+        return info
+
+    def pull(self):
+        """Returns (data or None if nothing saved yet, sha)."""
+        try:
+            got = self._request("GET", f"/contents/{SYNC_PATH}")
+        except urllib.error.HTTPError:
+            return None, None
+        return json.loads(base64.b64decode(got["content"]).decode("utf-8")), got["sha"]
+
+    def push(self, data, sha):
+        body = {"message": "Sync from desktop",
+                "content": base64.b64encode(canonical(data).encode("utf-8")).decode()}
+        if sha:
+            body["sha"] = sha
+        try:
+            return self._request("PUT", f"/contents/{SYNC_PATH}", body)["content"]["sha"]
+        except urllib.error.HTTPError:
+            raise SyncError(f"Couldn't find the repo \u201c{self.repo}\u201d, or the token can't access it.")
+
+
+def load_sync_config():
+    try:
+        return json.loads(SYNC_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_sync_config(cfg):
+    SYNC_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def phone_setup_link(cfg):
+    payload = json.dumps({"repo": cfg["repo"], "token": cfg["token"]}, separators=(",", ":"))
+    return PHONE_APP_URL + "#setup=" + base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+
+def qr_photo(text, target=250):
+    """A crisp QR code image for Tk, or None if the qrcode library isn't installed."""
+    if not qrcode:
+        return None
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=1, border=2)
+    qr.add_data(text)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white").get_image().convert("RGB")
+    scale = max(3, target // img.width)  # whole-pixel scaling keeps the code crisp for phone cameras
+    return ImageTk.PhotoImage(img.resize((img.width * scale, img.height * scale), Image.NEAREST))
 
 
 def load_catalog():
     """Returns (meals, is_fresh). Meals is [] if the catalog has never been downloaded."""
     try:
         cat = json.loads(CATALOG_FILE.read_text(encoding="utf-8"))
+        if cat["meals"] and "parts" not in cat["meals"][0]:
+            return [], False  # saved by an older version: download again for shopping-list ingredients
         age = datetime.date.today() - datetime.date.fromisoformat(cat["date"])
         return cat["meals"], age.days < CATALOG_MAX_AGE_DAYS
     except (OSError, ValueError, KeyError):
@@ -177,12 +346,13 @@ def api_get(endpoint, **params):
 
 
 def parse_meal(m):
-    ingredients = []
+    ingredients, parts = [], []
     for i in range(1, 21):
         ing = (m.get(f"strIngredient{i}") or "").strip()
         meas = (m.get(f"strMeasure{i}") or "").strip()
         if ing:
             ingredients.append(f"{meas} {ing}".strip())
+            parts.append({"q": meas, "n": ing})
     return {
         "id": m["idMeal"],
         "name": m["strMeal"],
@@ -190,6 +360,7 @@ def parse_meal(m):
         "area": AREA_FIX.get(m.get("strArea") or "", m.get("strArea") or ""),
         "thumb": m.get("strMealThumb") or "",
         "ingredients": ingredients,
+        "parts": parts,
         "instructions": m.get("strInstructions") or "",
         "url": m.get("strSource") or f"https://www.themealdb.com/meal/{m['idMeal']}",
         "youtube": m.get("strYoutube") or "",
@@ -274,6 +445,110 @@ def proteins(m):
     if not found and cat != "Dessert" and not OTHER_MEAT.search(text):
         found.add("vegetarian")
     return found
+
+
+# ---------------------------------------------------------------- shopping list (same rules as docs/core.js)
+
+# Checked in order: the first aisle with a matching word wins ("chicken stock" is Pantry, not Meat).
+AISLE_RULES = [(aisle, word_re(words)) for aisle, words in [
+    ("Frozen", ["frozen", "ice cream"]),
+    ("Spices & Seasonings", ["salt", "black pepper", "white pepper", "peppercorn", "cumin", "paprika", "turmeric",
+                             "cinnamon", "oregano", "dried thyme", "dried basil", "bay leaf", "bay leaves",
+                             "chilli powder", "chili powder", "cayenne", "nutmeg", "ground cloves", "whole cloves",
+                             "cardamom", "ground coriander", "coriander seed", "garam masala", "curry powder", "spice",
+                             "seasoning", "stock cube", "bouillon", "vanilla", "allspice", "saffron", "fenugreek",
+                             "mustard seed", "chilli flakes", "red pepper flakes", "five spice", "star anise"]),
+    ("Bakery", ["bread", "bun", "roll", "tortilla", "pita", "pitta", "baguette", "naan", "wrap", "croissant",
+                "bagel", "brioche", "ciabatta", "puff pastry", "pastry", "filo"]),
+    ("Pantry", ["flour", "sugar", "oil", "vinegar", "rice", "pasta", "spaghetti", "noodle", "stock", "broth",
+                "tomato puree", "tomato paste", "passata", "chopped tomatoes", "tinned", "canned", "lentil",
+                "chickpea", "kidney bean", "black bean", "baked bean", "soy sauce", "fish sauce", "worcestershire",
+                "honey", "syrup", "ketchup", "mustard", "mayonnaise", "baking powder", "baking soda", "bicarbonate",
+                "yeast", "oats", "breadcrumb", "cornstarch", "cornflour", "almond", "peanut", "walnut", "cashew",
+                "pine nut", "sesame", "coconut milk", "coconut cream", "chocolate", "cocoa", "wine", "raisin",
+                "sultana", "jam", "gelatine", "tahini", "couscous", "quinoa", "polenta", "macaroni", "lasagne",
+                "hot sauce", "sriracha", "custard"]),
+    ("Meat & Seafood", ["chicken", "beef", "pork", "lamb", "bacon", "sausage", "mince", "minced", "steak", "ham",
+                        "turkey", "duck", "fish", "salmon", "prawn", "shrimp", "cod", "haddock", "tuna", "mussel",
+                        "clam", "squid", "crab", "lobster", "chorizo", "veal", "goat", "mutton", "anchovy",
+                        "anchovies", "sardine", "mackerel", "scallop", "oxtail", "brisket", "pancetta", "prosciutto",
+                        "salami", "kielbasa", "saltfish"]),
+    ("Dairy & Eggs", ["milk", "buttermilk", "cream", "butter", "cheese", "yogurt", "yoghurt", "egg", "parmesan",
+                      "mozzarella", "cheddar", "creme fraiche", "cr\u00e8me fra\u00eeche", "sour cream", "ricotta",
+                      "feta", "mascarpone", "ghee", "paneer", "gruyere", "halloumi"]),
+    ("Produce", ["onion", "garlic", "tomato", "tomatoes", "potato", "potatoes", "carrot", "pepper", "lettuce",
+                 "spinach", "cabbage", "celery", "cucumber", "zucchini", "courgette", "mushroom", "lemon", "lime",
+                 "orange", "apple", "banana", "ginger", "parsley", "cilantro", "coriander", "basil", "mint", "thyme",
+                 "rosemary", "dill", "sage", "chive", "avocado", "chilli", "chillies", "chili", "jalapeno", "leek",
+                 "shallot", "scallion", "spring onion", "broccoli", "cauliflower", "pea", "green bean", "corn",
+                 "squash", "pumpkin", "aubergine", "eggplant", "kale", "berry", "berries", "strawberries",
+                 "blueberries", "raspberries", "cherries", "grape", "mango", "pineapple", "beetroot", "radish",
+                 "fennel", "asparagus", "sweet potato", "yam", "plantain", "okra", "bean sprout", "pak choi",
+                 "bok choy", "lemongrass", "herb", "pear", "peach", "plum", "cherry", "rhubarb", "coconut",
+                 "watercress", "rocket", "arugula", "sweetcorn"]),
+]]
+# Shown in the order you walk a store (the rules above are checked in a different order).
+AISLES = ["Produce", "Meat & Seafood", "Dairy & Eggs", "Bakery", "Pantry", "Spices & Seasonings", "Frozen", "Other"]
+SKIP_INGREDIENTS = {"water", "cold water", "hot water", "boiling water", "warm water", "ice"}
+
+
+def aisle_of(name):
+    return next((aisle for aisle, rx in AISLE_RULES if rx.search(name)), "Other")
+
+
+def ingredient_key(name):
+    """"Onions " and "onion" are the same item on the list."""
+    k = " ".join(name.strip().lower().split())
+    if re.search(r"(tomatoes|potatoes|chillies)$", k):
+        k = k[:-2]
+    elif len(k) > 3 and k.endswith("s") and not k.endswith("ss"):
+        k = k[:-1]
+    return k
+
+
+QUICK_ITEM = re.compile(r"^([\d\u00bc-\u00be\u2150-\u215e][\d\s/.,\u00bc-\u00be\u2150-\u215e]*"
+                        r"(?:\s*(?:g|kg|ml|l|oz|lbs?|cups?|tbsp|tsp|tins?|cans?|packs?|bags?|bunch(?:es)?|cloves?"
+                        r"|dozen)\b\.?)?)\s+(.+)$", re.I)
+
+
+def parse_quick_item(text):
+    """"2 lemons" -> ("2", "lemons"); "milk" -> ("", "milk")."""
+    m = QUICK_ITEM.match(text.strip())
+    return (m.group(1).strip(), m.group(2).strip()) if m else ("", text.strip())
+
+
+def meal_parts(meal, by_id):
+    """A meal's ingredients as [{q, n}] - from the meal, the recipe catalog, or plain ingredient lines."""
+    if not meal:
+        return []
+    if meal.get("parts"):
+        return meal["parts"]
+    known = by_id.get(meal.get("id"))
+    if known and known.get("parts"):
+        return known["parts"]
+    return [{"q": "", "n": line} for line in meal.get("ingredients", [])]
+
+
+def add_to_list(items, adds):
+    """Add ingredients to the list, combining with items still to buy. adds = [{name, qty, meal}]."""
+    added = combined = 0
+    for a in adds:
+        name = a["name"].strip()
+        if not name or name.lower() in SKIP_INGREDIENTS:
+            continue
+        key = ingredient_key(name)
+        hit = next((it for it in items if not it["checked"] and ingredient_key(it["name"]) == key), None)
+        if hit:
+            if a.get("qty"):
+                hit["qty"] = hit["qty"] + " + " + a["qty"] if hit["qty"] else a["qty"]
+            if a.get("meal") and a["meal"] not in hit["meals"]:
+                hit["meals"] = hit["meals"] + [a["meal"]]
+            combined += 1
+        else:
+            items.append({"name": name[:1].upper() + name[1:], "qty": a.get("qty") or "", "aisle": aisle_of(name),
+                          "checked": False, "meals": [a["meal"]] if a.get("meal") else []})
+            added += 1
+    return added, combined
 
 
 def fetch_by_ids(ids):
@@ -529,6 +804,14 @@ class MealPlanner(tk.Tk):
         self.minsize(720, 520)
         self.configure(bg=BG)
         self.data = load_data()
+        self.snapshot = json.loads(json.dumps(self.data))
+        self.stamp()
+        save_data(self.data)
+        self.sync_cfg = load_sync_config()
+        self.sync_job = None
+        self.sync_running = False
+        self.sync_again = False
+        self.sync_waiting = []
         self.ui_queue = queue.Queue()
         self.images = ImageLoader(self)
         self.save_buttons = []  # (button, meal name) pairs to update when Favorites change
@@ -552,6 +835,7 @@ class MealPlanner(tk.Tk):
             "week": self.build_week_page(),
             "explore": self.build_explore_page(),
             "favorites": self.build_fav_page(),
+            "shopping": self.build_shopping_page(),
         }
         for page in self.pages.values():
             page.place(relx=0, rely=0, relwidth=1, relheight=1)
@@ -561,10 +845,15 @@ class MealPlanner(tk.Tk):
 
         self.bind_all("<MouseWheel>", self.on_mousewheel)
         self.viewing_last = False
-        self.roll_over_week()
+        if self.sync_ready():
+            self.sync_now(then=self.roll_over_week)  # get the phone's changes before starting a new week
+        else:
+            self.roll_over_week()
+        self.after(SYNC_EVERY_MS, self.periodic_sync)
         self.refresh_week()
         self.refresh_explore()
         self.refresh_favs()
+        self.refresh_shopping()
         self.show_page("week")
 
         if not self.catalog:
@@ -576,7 +865,254 @@ class MealPlanner(tk.Tk):
     # ------------------------------------------------------------ plumbing
 
     def save(self):
+        self.stamp()
         save_data(self.data)
+        self.schedule_sync()
+
+    def stamp(self):
+        """Record what changed since the last save, so syncing can merge edits from both devices."""
+        now, d, prev = now_ms(), self.data, self.snapshot
+        strip = lambda m: {k: v for k, v in m.items() if k != "updated"}
+        for key in ("favorites", "shopping"):
+            before = {f.get("uid"): f for f in prev.get(key, [])}
+            seen = set()
+            for i, f in enumerate(d.get(key, [])):
+                if not f.get("uid"):
+                    f["uid"], f["added"] = uuid.uuid4().hex, now + i
+                seen.add(f["uid"])
+                old = before.get(f["uid"])
+                if old is None or strip(old) != strip(f):
+                    f["updated"] = now
+            for uid in before:
+                if uid and uid not in seen:
+                    d["tombstones"][uid] = now
+        d["week"] = [slim_meal(m) for m in d["week"]]
+        d["sides"] = [slim_meal(m) for m in d["sides"]]
+        for h in d["history"]:
+            h["week"] = [slim_meal(m) for m in h["week"]]
+            h["sides"] = [slim_meal(m) for m in h["sides"]]
+        if any(prev.get(k) != d.get(k) for k in PLAN_KEYS):
+            d["plan_updated"] = now
+        if any(prev.get(k) != d.get(k) for k in SETTINGS_KEYS):
+            d["settings_updated"] = now
+        self.snapshot = json.loads(json.dumps(d))
+
+    # ------------------------------------------------------------ sync
+
+    def sync_ready(self):
+        return bool(self.sync_cfg.get("repo") and self.sync_cfg.get("token"))
+
+    def schedule_sync(self, delay=2000):
+        if not self.sync_ready():
+            return
+        if self.sync_job:
+            self.after_cancel(self.sync_job)
+        self.sync_job = self.after(delay, self.sync_now)
+
+    def periodic_sync(self):
+        if self.sync_ready() and not self.sync_running:
+            self.sync_now()
+        self.after(SYNC_EVERY_MS, self.periodic_sync)
+
+    def sync_now(self, then=None):
+        """Pull the phone's changes, merge, and push the result back."""
+        if then:
+            self.sync_waiting.append(then)
+        if not self.sync_ready():
+            return self._sync_finished(None)
+        if self.sync_running:
+            self.sync_again = True
+            return
+        self.sync_job = None
+        self.sync_running = True
+        self.set_sync_status("syncing")
+        store = GitHubStore(self.sync_cfg["repo"], self.sync_cfg["token"])
+
+        def pulled(result, error):
+            if error:
+                return self._sync_finished(error)
+            remote, sha = result
+            merged = merge_data(self.data, remote)
+            if canonical(merged) != canonical(self.data):
+                self.apply_synced(merged)
+            if remote is not None and canonical(merged) == canonical(remote):
+                return self._sync_finished(None)
+            self.background(lambda: store.push(merged, sha), pushed)
+
+        def pushed(_, error):
+            if isinstance(error, SyncConflict):
+                self.sync_again, error = True, None
+            self._sync_finished(error)
+
+        self.background(store.pull, pulled)
+
+    def _sync_finished(self, error):
+        self.sync_running = False
+        if self.sync_ready():
+            if error:
+                self.set_sync_status("error", str(error))
+            else:
+                self.sync_cfg["last_sync"] = now_ms()
+                save_sync_config(self.sync_cfg)
+                self.set_sync_status("ok")
+        else:
+            self.set_sync_status("off")
+        waiting, self.sync_waiting = self.sync_waiting, []
+        for fn in waiting:
+            fn()
+        if self.sync_again:
+            self.sync_again = False
+            self.schedule_sync(500)
+
+    def apply_synced(self, merged):
+        """Use data merged with the phone's copy, and redraw what changed."""
+        old = self.data
+        self.data = merged
+        self.snapshot = json.loads(json.dumps(merged))
+        save_data(merged)
+        self.set_source(merged["source"], save=False)
+        if canonical(old["filters"]) != canonical(merged["filters"]):
+            self.style_filter_chips()
+            self.refresh_cuisine_menu()
+            self.refresh_explore()
+        self.refresh_week()
+        self.refresh_favs()
+        self.refresh_hearts()
+        self.refresh_shopping()
+
+    def set_sync_status(self, state, detail=""):
+        self.sync_state, self.sync_detail = state, detail
+        text, color = {
+            "off": ("\u21c5  Sync off", MUTED),
+            "syncing": ("\u21c5  Syncing\u2026", MUTED),
+            "ok": ("\u2713  Synced", GREEN),
+            "error": ("\u26a0  Sync problem", ACCENT_DARK),
+        }[state]
+        self.sync_chip.config(text=text, fg=color)
+        tip = detail or {"off": "Set up syncing with your phone", "syncing": "Syncing with your phone\u2026",
+                         "ok": "Your favorites and plans are synced with your phone"}.get(state, "")
+        self.sync_tooltip.text = tip
+        if getattr(self, "sync_status_label", None) and self.sync_status_label.winfo_exists():
+            self.sync_status_label.config(text=self.sync_status_text(), fg=color)
+
+    def sync_status_text(self):
+        if self.sync_state == "error":
+            return self.sync_detail
+        if self.sync_state == "syncing":
+            return "Syncing\u2026"
+        if self.sync_state == "ok":
+            when = datetime.datetime.fromtimestamp(self.sync_cfg.get("last_sync", now_ms()) / 1000)
+            return f"Connected to {self.sync_cfg['repo']} \u2014 last synced {when:%I:%M %p}".replace(" 0", " ")
+        return "Not connected yet."
+
+    def sync_dialog(self):
+        win = tk.Toplevel(self, bg=CARD)
+        win.title("Sync with your phone")
+        win.transient(self)
+        win.resizable(False, False)
+        win.geometry(f"+{self.winfo_rootx() + 220}+{self.winfo_rooty() + 50}")
+        win.bind("<Escape>", lambda e: win.destroy())
+        frm = tk.Frame(win, bg=CARD, padx=24, pady=20)
+        frm.pack(fill="both", expand=True)
+        left = tk.Frame(frm, bg=CARD)
+        left.pack(side="left", fill="y")
+        tk.Label(left, text="Sync with your phone", bg=CARD, fg=TEXT, font=(F, 15, "bold")).pack(anchor="w")
+        tk.Label(left, text="Your favorites, weekly plans and filters are kept in a private GitHub repo that\n"
+                            "only you can see. The desktop and phone apps both sync through it.",
+                 bg=CARD, fg=MUTED, font=(F, 9), justify="left").pack(anchor="w", pady=(2, 12))
+
+        def step(num, title, detail, link_text, url):
+            row = tk.Frame(left, bg=CARD)
+            row.pack(fill="x", pady=4)
+            tk.Label(row, text=str(num), bg=ACCENT, fg="white", font=(F, 10, "bold"), width=2).pack(
+                side="left", anchor="n", padx=(0, 10))
+            box = tk.Frame(row, bg=CARD)
+            box.pack(side="left", fill="x", expand=True)
+            tk.Label(box, text=title, bg=CARD, fg=TEXT, font=(F, 10, "bold")).pack(anchor="w")
+            if detail:
+                tk.Label(box, text=detail, bg=CARD, fg=MUTED, font=(F, 9), justify="left").pack(anchor="w")
+            if url:
+                button(box, link_text, lambda: webbrowser.open(url), "soft", small=True).pack(anchor="w", pady=(4, 0))
+
+        step(1, "Create a private repo for your data", "Keep the name meal-planner-data and leave it Private.",
+             "Create repo on GitHub \u2197",
+             "https://github.com/new?name=meal-planner-data&visibility=private"
+             "&description=Meal+Planner+sync+data")
+        step(2, "Create a token that can only use that repo",
+             "Name it Meal Planner, Expiration: 1 year \u2192 Only select repositories \u2192 meal-planner-data\n"
+             "\u2192 Permissions: Contents \u2192 Read and write \u2192 Generate token, then copy it.",
+             "Create token on GitHub \u2197", "https://github.com/settings/personal-access-tokens/new")
+        step(3, "Paste them here and connect", "", "", None)
+
+        form = tk.Frame(left, bg=CARD)
+        form.pack(fill="x", padx=(34, 0))
+        fields = {}
+        for row, (key, label, hide) in enumerate([("repo", "Repo", False), ("token", "Token", True)]):
+            tk.Label(form, text=label, bg=CARD, fg=TEXT, font=(F, 10, "bold")).grid(
+                row=row, column=0, sticky="w", pady=4, padx=(0, 10))
+            var = tk.StringVar(value=self.sync_cfg.get(key, ""))
+            tk.Entry(form, textvariable=var, width=40, relief="flat", font=(F, 10), bg=GHOST, show="\u2022" if hide else "",
+                     highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT).grid(
+                row=row, column=1, sticky="we", pady=4, ipady=4)
+            fields[key] = var
+        tk.Label(form, text="Repo looks like yourname/meal-planner-data", bg=CARD, fg=MUTED,
+                 font=(F, 8)).grid(row=2, column=1, sticky="w")
+
+        self.sync_status_label = tk.Label(left, text=self.sync_status_text(), bg=CARD, font=(F, 9, "bold"),
+                                          wraplength=460, justify="left", fg=MUTED)
+        self.sync_status_label.pack(anchor="w", pady=(10, 0), padx=(34, 0))
+        btns = tk.Frame(left, bg=CARD)
+        btns.pack(anchor="w", pady=(10, 0), padx=(34, 0))
+
+        phone = tk.Frame(frm, bg=CARD)
+
+        def show_phone():
+            for w in phone.winfo_children():
+                w.destroy()
+            if not self.sync_ready():
+                return phone.pack_forget()
+            phone.pack(side="left", fill="y", padx=(28, 0))
+            tk.Label(phone, text="Set up your phone", bg=CARD, fg=TEXT, font=(F, 12, "bold")).pack(anchor="w")
+            photo = qr_photo(phone_setup_link(self.sync_cfg), 230)
+            if photo:
+                img = tk.Label(phone, image=photo, bg=CARD)
+                img.image = photo
+                img.pack(pady=8)
+            tk.Label(phone, bg=CARD, fg=MUTED, font=(F, 9), justify="left", wraplength=250, text=(
+                "Scan with your phone's camera. The app opens already connected.\n\n"
+                "Then add it to your home screen:\n"
+                "\u2022 iPhone (Safari): Share \u2192 Add to Home Screen\n"
+                "\u2022 Android (Chrome): \u22ee \u2192 Install app\n\n"
+                "Keep this code private \u2014 it contains your sync key.")).pack(anchor="w")
+
+        def connect():
+            cfg = {"repo": fields["repo"].get().strip(), "token": fields["token"].get().strip()}
+            if not cfg["repo"] or "/" not in cfg["repo"] or not cfg["token"]:
+                return self.sync_status_label.config(text="Enter the repo (yourname/meal-planner-data) and token.",
+                                                     fg=ACCENT_DARK)
+            self.sync_status_label.config(text="Checking\u2026", fg=MUTED)
+
+            def checked(_, error):
+                if error:
+                    return self.sync_status_label.config(text=str(error), fg=ACCENT_DARK)
+                self.sync_cfg = cfg
+                save_sync_config(cfg)
+                self.sync_now(then=lambda: win.winfo_exists() and show_phone())
+            self.background(GitHubStore(cfg["repo"], cfg["token"]).check, checked)
+
+        def disconnect():
+            if messagebox.askyesno("Turn off sync", "Stop syncing with your phone?\n\nYour data stays on this "
+                                   "computer and in the GitHub repo.", parent=win):
+                self.sync_cfg = {}
+                save_sync_config({})
+                self.set_sync_status("off")
+                show_phone()
+
+        button(btns, "Connect & sync", connect).pack(side="left")
+        button(btns, "Sync now", lambda: self.sync_now(), "ghost").pack(side="left", padx=8)
+        button(btns, "Turn off", disconnect, "ghost").pack(side="left")
+        show_phone()
+        win.grab_set()
 
     def call_on_ui(self, fn):
         """Thread-safe: schedule fn to run on the Tk main thread."""
@@ -589,6 +1125,17 @@ class MealPlanner(tk.Tk):
         except queue.Empty:
             pass
         self.after(50, self.poll_ui_queue)
+
+    def background(self, work, on_done):
+        """Run work() on a worker thread, then on_done(result, error) on the UI thread (no message)."""
+        def worker():
+            try:
+                result, error = work(), None
+            except Exception as e:
+                result, error = None, e
+            self.call_on_ui(lambda: on_done(result, error))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def run_in_background(self, work, on_done, busy_msg):
         self.notify(busy_msg, sticky=True)
@@ -725,8 +1272,13 @@ class MealPlanner(tk.Tk):
         bar.pack(fill="x")
         tk.Label(bar, text="☕  Meal Planner", bg=CARD, fg=ACCENT, font=(F, 16, "bold"),
                  padx=20, pady=12).pack(side="left")
+        self.sync_chip = tk.Label(bar, bg=CARD, font=(F, 10, "bold"), cursor="hand2", padx=10)
+        self.sync_chip.pack(side="left")
+        self.sync_chip.bind("<Button-1>", lambda e: self.sync_dialog())
+        self.sync_tooltip = Tooltip(self.sync_chip, "")
+        self.set_sync_status("off")
         self.nav = {}
-        for key, label in [("favorites", "♥  Favorites"), ("explore", "✨  Explore"),
+        for key, label in [("shopping", "\u2611  Shopping"), ("favorites", "♥  Favorites"), ("explore", "✨  Explore"),
                            ("week", "▦  This Week")]:
             lbl = tk.Label(bar, text=label, bg=CARD, fg=MUTED, font=(F, 11, "bold"),
                            padx=18, pady=8, cursor="hand2")
@@ -761,6 +1313,9 @@ class MealPlanner(tk.Tk):
             "Nothing from last week is repeated. \u21bb Swap changes one day; Keep holds a day.")
         button(actions, "Copy list", self.copy_week, "ghost").pack(side="right")
         button(actions, "\u27a4  Send", self.share_dialog, "ghost").pack(side="right", padx=(0, 8))
+        shop = button(actions, "\u2611  Shopping", self.week_ingredients, "ghost")
+        shop.pack(side="right", padx=(0, 8))
+        Tooltip(shop, "Add this week's ingredients to your shopping list")
         self.plan_actions = tk.Frame(actions, bg=BG)
         self.plan_actions.pack(side="right")
         button(self.plan_actions, "\u21bb  Shuffle Week", self.shuffle_week).pack(side="right", padx=8)
@@ -1013,11 +1568,11 @@ class MealPlanner(tk.Tk):
             if meal:
                 set_photo(self.images, img, meal.get("thumb"), (160, 120), meal["name"])
                 img.config(cursor="hand2")
-                img.bind("<Button-1>", lambda e, m=meal: self.show_details(m))
+                img.bind("<Button-1>", lambda e, m=meal: self.open_meal(m))
                 name = tk.Label(body, text=meal["name"], bg=CARD, fg=TEXT, font=(F, 10, "bold"),
                                 wraplength=146, justify="left", anchor="w", cursor="hand2")
                 name.pack(fill="x")
-                name.bind("<Button-1>", lambda e, m=meal: self.show_details(m))
+                name.bind("<Button-1>", lambda e, m=meal: self.open_meal(m))
                 origin = "♥ Favorite" if meal.get("origin") == "Favorite" else "✨ New idea"
                 tk.Label(body, text=origin, bg=CARD, fg=MUTED, font=(F, 8), anchor="w").pack(fill="x")
             else:
@@ -1246,13 +1801,7 @@ class MealPlanner(tk.Tk):
                 qr_note.config(text="Install the qrcode library to text from your phone:\n"
                                     "python -m pip install qrcode")
                 return
-            qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_L, box_size=1, border=2)
-            qr.add_data("SMSTO::" + message())
-            qr.make(fit=True)
-            img = qr.make_image(fill_color="black", back_color="white").get_image().convert("RGB")
-            scale = max(3, 250 // img.width)  # whole-pixel scaling keeps the code crisp for phone cameras
-            img = img.resize((img.width * scale, img.height * scale), Image.NEAREST)
-            photo = ImageTk.PhotoImage(img)
+            photo = qr_photo("SMSTO::" + message())
             qr_img.config(image=photo)
             qr_img.image = photo
             qr_note.config(text="Text it from your phone:\npoint your phone's camera at this code, tap the "
@@ -1479,6 +2028,163 @@ class MealPlanner(tk.Tk):
         grid.set_cards(cards, "No recipes match these filters.\nTry another cuisine or meal type, "
                               "or turn off a Leave out option.")
 
+    # ------------------------------------------------------------ Shopping list
+
+    def build_shopping_page(self):
+        page = tk.Frame(self.pages_frame, bg=BG)
+        self.shop_title, actions = self.page_header(
+            page, "Shopping list", "Sorted by aisle. Tick items as they go in the cart.")
+        self.clear_btn = button(actions, "Clear checked", self.clear_checked, "ghost")
+        self.clear_btn.pack(side="right")
+        button(actions, "\u2611  Add this week's ingredients", self.week_ingredients, "soft").pack(side="right", padx=8)
+        add = button(actions, "Add", self.quick_add_item)
+        add.pack(side="right")
+        self.item_entry = PlaceholderEntry(actions, "Add an item, e.g. 2 lemons", width=28)
+        self.item_entry.pack(side="right", padx=8, ipady=5)
+        self.item_entry.bind("<Return>", lambda e: self.quick_add_item())
+        page.cards = ScrollGrid(page, card_width=330)
+        page.cards.pack(fill="both", expand=True, padx=8)
+        return page
+
+    def quick_add_item(self):
+        qty, name = parse_quick_item(self.item_entry.get())
+        if not name:
+            return self.item_entry.focus_set()
+        add_to_list(self.data["shopping"], [{"name": name, "qty": qty}])
+        self.item_entry.delete(0, "end")
+        self.shopping_changed()
+
+    def shopping_changed(self):
+        self.save()
+        self.refresh_shopping()
+
+    def toggle_item(self, uid):
+        for it in self.data["shopping"]:
+            if it["uid"] == uid:
+                it["checked"] = not it["checked"]
+        self.shopping_changed()
+
+    def remove_item(self, uid):
+        self.data["shopping"] = [it for it in self.data["shopping"] if it["uid"] != uid]
+        self.shopping_changed()
+
+    def clear_checked(self):
+        self.data["shopping"] = [it for it in self.data["shopping"] if not it["checked"]]
+        self.shopping_changed()
+
+    def refresh_shopping(self):
+        items = self.data["shopping"]
+        to_buy = [it for it in items if not it["checked"]]
+        done = [it for it in items if it["checked"]]
+        self.nav["shopping"].config(text=f"\u2611  Shopping ({len(to_buy)})" if to_buy else "\u2611  Shopping")
+        self.shop_title.config(text=f"Shopping list \u00b7 {len(to_buy)} to buy" if items else "Shopping list")
+        self.clear_btn.config(text=f"Clear {len(done)} checked" if done else "Clear checked",
+                              state="normal" if done else "disabled")
+        grid = self.pages["shopping"].cards
+        cards = []
+        groups = [(aisle, sorted((it for it in to_buy if (it.get("aisle") or "Other") == aisle),
+                                 key=lambda it: it["name"].lower())) for aisle in AISLES]
+        groups = [(a, g) for a, g in groups if g] + ([("In cart", done)] if done else [])
+        for aisle, group in groups:
+            card = tk.Frame(grid.inner, bg=CARD, highlightthickness=1, highlightbackground=BORDER, padx=12, pady=10)
+            tk.Label(card, text=aisle.upper(), bg=CARD, fg=ACCENT_DARK if aisle != "In cart" else MUTED,
+                     font=(F, 9, "bold"), anchor="w").pack(fill="x", pady=(0, 4))
+            for it in group:
+                row = tk.Frame(card, bg=CARD)
+                row.pack(fill="x", pady=2)
+                var = tk.BooleanVar(value=it["checked"])
+                tk.Checkbutton(row, variable=var, bg=CARD, activebackground=CARD, cursor="hand2",
+                               command=lambda u=it["uid"]: self.toggle_item(u)).pack(side="left", anchor="n")
+                text = tk.Frame(row, bg=CARD)
+                text.pack(side="left", fill="x", expand=True)
+                label = it["name"] + (f"  \u2014 {it['qty']}" if it.get("qty") else "")
+                name = tk.Label(text, text=label, bg=CARD, fg=MUTED if it["checked"] else TEXT, anchor="w",
+                                justify="left", wraplength=250, cursor="hand2",
+                                font=(F, 10, "overstrike") if it["checked"] else (F, 10, "bold"))
+                name.pack(fill="x")
+                name.bind("<Button-1>", lambda e, u=it["uid"]: self.toggle_item(u))
+                if it.get("meals"):
+                    tk.Label(text, text="for " + ", ".join(it["meals"]), bg=CARD, fg=MUTED, font=(F, 8),
+                             anchor="w", justify="left", wraplength=250).pack(fill="x")
+                x = tk.Label(row, text="\u2715", bg=CARD, fg=MUTED, cursor="hand2", font=(F, 9))
+                x.pack(side="right", anchor="n", padx=(6, 0))
+                x.bind("<Button-1>", lambda e, u=it["uid"]: self.remove_item(u))
+            cards.append(card)
+        grid.set_cards(cards, "Your shopping list is empty.\nClick \u201cAdd this week's ingredients\u201d, "
+                              "or open any recipe and add its ingredients.")
+
+    def week_ingredients(self):
+        d = self.data
+        meals = []
+        for day, meal, side in zip(DAYS, d["week"], d["sides"]):
+            if meal:
+                meals.append((day, meal))
+            if side:
+                meals.append((day + " side", side))
+        if not meals:
+            return self.notify("Plan some meals first")
+        if any(m.get("id") for _, m in meals) and not self.catalog:
+            return self.ensure_catalog(then=lambda: self.ingredients_dialog(meals))
+        self.ingredients_dialog(meals)
+
+    def ingredients_dialog(self, meals):
+        """Tick the ingredients you need for one or more meals, then add them to the shopping list."""
+        win = tk.Toplevel(self, bg=BG)
+        win.title("Add to shopping list")
+        win.transient(self)
+        win.geometry(f"620x640+{self.winfo_rootx() + 260}+{self.winfo_rooty() + 40}")
+        win.bind("<Escape>", lambda e: win.destroy())
+        head = tk.Frame(win, bg=BG, padx=20, pady=14)
+        head.pack(fill="x")
+        tk.Label(head, text="Add to shopping list", bg=BG, fg=TEXT, font=(F, 15, "bold")).pack(anchor="w")
+        tk.Label(head, text="Untick anything you already have. Matching items already on your list are combined.",
+                 bg=BG, fg=MUTED, font=(F, 9)).pack(anchor="w")
+        foot = tk.Frame(win, bg=BG, padx=20, pady=12)
+        foot.pack(side="bottom", fill="x")
+        win.scroll_grid = grid = ScrollGrid(win, card_width=560, gap=12)
+        grid.pack(fill="both", expand=True)
+
+        checks = []
+        cards = []
+        for label, meal in meals:
+            full = dict(self.catalog_by_id.get(meal.get("id"), {}), **meal)
+            card = tk.Frame(grid.inner, bg=CARD, highlightthickness=1, highlightbackground=BORDER, padx=12, pady=10)
+            title = f"{label}: {meal['name']}" if label else meal["name"]
+            tk.Label(card, text=title, bg=CARD, fg=TEXT, font=(F, 11, "bold"), anchor="w", wraplength=520,
+                     justify="left").pack(fill="x", pady=(0, 4))
+            parts = meal_parts(full, self.catalog_by_id)
+            if not parts:
+                tk.Label(card, text="No ingredients saved for this meal.", bg=CARD, fg=MUTED, font=(F, 9),
+                         anchor="w").pack(fill="x")
+            for part in parts:
+                var = tk.BooleanVar(value=part["n"].strip().lower() not in SKIP_INGREDIENTS)
+                text = part["n"] + (f"  \u2014 {part['q']}" if part["q"] else "")
+                tk.Checkbutton(card, text=text, variable=var, bg=CARD, activebackground=CARD, anchor="w",
+                               font=(F, 10), cursor="hand2", command=lambda: update()).pack(fill="x")
+                checks.append((var, {"name": part["n"], "qty": part["q"], "meal": meal["name"]}))
+            cards.append(card)
+        grid.set_cards(cards)
+
+        def update():
+            n = sum(v.get() for v, _ in checks)
+            add_btn.config(text=f"Add {n} to shopping list" if n else "Add to shopping list")
+
+        def add():
+            adds = [a for v, a in checks if v.get()]
+            if not adds:
+                return self.notify("Tick the ingredients you need")
+            added, combined = add_to_list(self.data["shopping"], adds)
+            self.shopping_changed()
+            win.destroy()
+            self.notify(f"Added {added} item{'s' if added != 1 else ''} to your shopping list"
+                        + (f", {combined} combined with items already on it" if combined else ""))
+
+        button(foot, "Cancel", win.destroy, "ghost").pack(side="right")
+        add_btn = button(foot, "Add to shopping list", add)
+        add_btn.pack(side="right", padx=8)
+        update()
+        win.grab_set()
+
     # ------------------------------------------------------------ recipe details popup
 
     def show_details(self, meal):
@@ -1507,6 +2213,9 @@ class MealPlanner(tk.Tk):
                 side="left", padx=8)
         if meal.get("youtube"):
             button(row, "▶ Watch video", lambda: webbrowser.open(meal["youtube"]), "ghost").pack(side="left")
+        if meal_parts(meal, self.catalog_by_id):
+            button(info, "\u2611  Add ingredients to shopping list", lambda: self.ingredients_dialog([("", meal)]),
+                   "soft").pack(anchor="w", pady=(8, 0))
 
         text = tk.Text(win, wrap="word", font=(F, 10), relief="flat", bg=CARD, fg=TEXT,
                        padx=20, pady=4, spacing1=2, spacing3=2)
@@ -1630,6 +2339,7 @@ class MealPlanner(tk.Tk):
     def add_favorite(self, meal):
         if self.is_favorite(meal["name"]):
             return
+        meal = dict(self.catalog_by_id.get(meal.get("id"), {}), **meal)
         fav = {k: meal[k] for k in ("id", "name", "category", "area", "thumb", "ingredients",
                                     "instructions", "url", "youtube") if k in meal}
         fav.setdefault("notes", "")
@@ -1708,10 +2418,12 @@ class MealPlanner(tk.Tk):
                                               "Dinner or Side.", parent=win)
             meal = dict(existing, name=name, url=url_var.get().strip(),
                         thumb=thumb_var.get().strip(), notes=notes.get("1.0", "end").strip(), types=types)
-            if idx is None:
+            spot = next((i for i, f in enumerate(self.data["favorites"])
+                         if existing and f.get("uid") == existing.get("uid")), None)
+            if spot is None:
                 self.data["favorites"].append(meal)
             else:
-                self.data["favorites"][idx] = meal
+                self.data["favorites"][spot] = meal
             self.favorites_changed()
             self.notify(f"♥ Saved “{name}”")
             win.destroy()

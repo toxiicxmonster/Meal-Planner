@@ -5,3 +5,6 @@ meal_data.json
 image_cache/
 recipe_catalog.json
 __pycache__/
+
+# Sync connection details (contains your GitHub token)
+sync_config.json

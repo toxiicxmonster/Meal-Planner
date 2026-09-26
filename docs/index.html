@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Meal Planner</title>
+  <meta name="description" content="Plan a week of dinners from your favorites and new ideas.">
+  <meta name="theme-color" content="#E4572E">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Meals">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="style.css">
+  <script src="core.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">&#9749; Meal Planner</div>
+    <button class="sync-chip" data-act="settings" id="sync-chip" aria-label="Sync settings">Sync off</button>
+  </header>
+  <main id="view" tabindex="-1"></main>
+  <nav class="tabs" aria-label="Pages">
+    <button data-act="page" data-page="week" id="tab-week"><span class="tab-icon">&#9638;</span>This Week</button>
+    <button data-act="page" data-page="explore" id="tab-explore"><span class="tab-icon">&#10024;</span>Explore</button>
+    <button data-act="page" data-page="favorites" id="tab-favorites"><span class="tab-icon">&#9829;</span>Favorites</button>
+    <button data-act="page" data-page="shopping" id="tab-shopping"><span class="tab-icon">&#9745;</span>List<span class="badge" id="list-badge"></span></button>
+  </nav>
+  <div id="sheet-root"></div>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <noscript>This app needs JavaScript turned on.</noscript>
+</body>
+</html>
