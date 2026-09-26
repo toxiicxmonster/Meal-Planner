@@ -1,3 +1,4 @@
+// GENERATED from docs/core.js by scripts/sync-core.js — edit docs/core.js instead.
 /* Meal Planner - shared logic for the phone app (no page code, so it can be tested with Node).
    The meal rules and mergeData() match the desktop app (meal_planner.pyw) so the two stay in sync. */
 (function (root) {

@@ -1,104 +1,129 @@
 # Meal Planner
 
-Plan a week of dinners from your favorite meals and new ideas, then turn it into a shopping list. There's a **desktop app** for Windows (it also runs on Mac and Linux) and a **phone app** for iPhone and Android. They stay in sync through a private GitHub repo that only you can see.
+Plan a week of dinners from your favorite meals and new ideas, then turn it into a shopping list. Share it all with your family: everyone sees the same week, favorites and shopping list, and changes show up on each other's phones within seconds.
 
-Recipes and photos come from [TheMealDB](https://www.themealdb.com), a free recipe database.
+There are three apps, and they all share your family's data:
+
+| App | Where | Folder |
+|---|---|---|
+| **iPhone app** (native) | iPhone (Android also possible) | `mobile/` |
+| **Desktop app** | Windows (also Mac and Linux) | `meal_planner.pyw` |
+| **Web app** | any phone or computer browser | `docs/` |
+
+Recipes and photos come from [TheMealDB](https://www.themealdb.com), a free recipe database. Family sharing runs on [Supabase](https://supabase.com), a hosted database with a free tier.
 
 ## What it does
 
 - **This Week**: a random Saturday-to-Friday dinner menu, picked from your Favorites, from new ideas, or from both. Nothing you had last week is repeated.
-  - **↻ Swap** a single day, **Choose** a favorite for a day, or tick **Keep** to hold a day when you shuffle.
-  - Add a side to any day, picked at random or chosen from your Favorites.
-  - See **Last week**, or use **Start next week** to plan ahead.
+  - **Swap** a single day, **Choose** a favorite for a day, or **Keep** a day so shuffling won't change it.
+  - Add a side to any day, picked at random or chosen from your favorites tagged **Side**.
+  - See **Last week**, or start planning **Next week** early.
   - **Send** the menu by text, Messenger or email.
-- **Explore**: browse all ~790 TheMealDB recipes. Filter by meal type (breakfast, lunch, dinner, dessert, sides) and by cuisine or region, leave out seafood, poultry, beef, pork, lamb or vegetarian dishes, and search by dish or ingredient.
-- **Favorites**: your own meals, sorted into Dinner, Lunch, Breakfast and Sides tabs. A meal can be in more than one tab.
-- **Shopping list**: add ingredients from any recipe or from the whole week. Items are grouped by store aisle and duplicates are combined ("Onion — 2 + 1", for Tacos and Chili). Check items off as they go in the cart.
+- **Explore**: browse TheMealDB's recipes (about 790), loaded live each time you open the app. Filter by meal type and by cuisine or region, leave out seafood, poultry, beef, pork, lamb or vegetarian dishes, and search by dish or ingredient.
+- **Favorites**: your own meals in Dinner, Lunch, Breakfast and Sides tabs. A meal can be in more than one.
+- **Shopping list**: add ingredients from any recipe or the whole week, grouped by store aisle, with duplicates combined ("Onion — 2 + 1" for Tacos and Chili). Check items off as they go in the cart.
+- **Family**: sign in with an emailed code (no password), start a family, and invite people with an 8-character code. The owner can remove members.
 
 ---
 
 ## Setup
 
-Setup has four parts. Only the first is required. The rest add the phone app and syncing.
+Do these in order. Part 1 is done once by whoever runs the app for the family.
 
-1. [Run the desktop app](#1-run-the-desktop-app)
-2. [Put the phone app online](#2-put-the-phone-app-online) (one time, for whoever owns the GitHub repo)
-3. [Connect sync on the desktop](#3-connect-sync-on-the-desktop)
-4. [Set up your phone](#4-set-up-your-phone)
+1. [Set up family sharing (Supabase)](#1-set-up-family-sharing-supabase) (once)
+2. [Put the app on your iPhones](#2-put-the-app-on-your-iphones)
+3. [Run the desktop app](#3-run-the-desktop-app) (optional)
+4. [Create your family and invite people](#4-create-your-family-and-invite-people)
 
-### 1. Run the desktop app
+You'll need **Node.js** (LTS, from [nodejs.org](https://nodejs.org)) and **Python 3.10+** (from [python.org](https://www.python.org/downloads/); on Windows tick **"Add python.exe to PATH"**). Download this project with **Code → Download ZIP** on GitHub, or `git clone https://github.com/toxiicxmonster/Meal-Planner.git`.
 
-You need **Python 3.10 or newer**.
+### 1. Set up family sharing (Supabase)
 
-1. **Install Python** from [python.org/downloads](https://www.python.org/downloads/). On Windows, tick **"Add python.exe to PATH"** in the installer. The python.org installer includes Tkinter, which the app needs for its windows.
-2. **Download this project**: click **Code → Download ZIP** on GitHub and unzip it, or run:
+1. **Create a project.** Sign up at [supabase.com](https://supabase.com) and click **New project**. The free plan is plenty. Pick any name, set a database password (you won't need it again), and choose the region closest to you.
+2. **Create the tables and rules.** In your project, open **SQL Editor → New query**. Paste in everything from [`supabase/schema.sql`](supabase/schema.sql) and click **Run**. It should say *Success*. Running it again later is safe.
+3. **Make sign-in emails show a code.** By default Supabase emails a sign-in *link*; the apps use a 6-digit *code* instead.
+   - Go to **Authentication**, find the **email templates**, and open **Magic Link**.
+   - Replace the message with:
+     ```html
+     <h2>Your Meal Planner sign-in code</h2>
+     <p>Enter this code in the app: <strong>{{ .Token }}</strong></p>
+     ```
+   - Save.
+4. **Let sign-in emails reach your family.** Supabase's built-in email only delivers to people on your Supabase project's team, and only **2 emails per hour**.
+   - **Just your family:** invite your partner to your Supabase organization (**Organization settings → Team → Invite**). They don't need to do anything in Supabase; being on the team lets the code emails reach them. Sign in on each device a few minutes apart.
+   - **Publishing the app to other people:** set up your own email sending under **Authentication → SMTP Settings**, using any email service (for example Resend or Brevo, which have free tiers).
+5. **Connect the apps to your project.**
+   - In **Project Settings → API Keys**, copy the **Project URL** and the **publishable key** (it starts with `sb_publishable_`).
+   - In a terminal in the project folder, run:
+     ```
+     python supabase/set_config.py https://YOUR-PROJECT.supabase.co sb_publishable_xxxxxxxx
+     ```
+   - This writes the settings for all three apps: `supabase/config.json`, `mobile/src/lib/config.js` and `docs/config.js`.
+
+   The publishable key is meant to be inside apps. The security rules from step 2 decide what each person can see: only members of a family can read or change that family's data.
+
+### 2. Put the app on your iPhones
+
+Apple only allows your own apps onto iPhones through its **Apple Developer Program ($99/year)**, and that now includes testing with Expo. You also need a free **Expo account** ([expo.dev/signup](https://expo.dev/signup)); Expo builds the iPhone app in the cloud, so no Mac is needed.
+
+> **Until you sign up:** use the **web app** on your phones (see [Web app](#web-app-optional)). It has the same features and joins the same family, so nothing is lost when you switch to the iPhone app later.
+
+1. **Join the Apple Developer Program** at [developer.apple.com/programs](https://developer.apple.com/programs/). Approval can take a day or two.
+2. **Pick your app's ID.** In `mobile/app.json`, change `ios.bundleIdentifier` (currently `com.mealplanner.family`) to something unique to you, like `com.yourname.mealplanner`.
+3. **Install and build.** In a terminal:
    ```
-   git clone https://github.com/toxiicxmonster/Meal-Planner.git
+   cd mobile
+   npm install
+   npx eas-cli@latest login
+   npx eas-cli@latest build --platform ios
    ```
-3. **Install the two libraries it uses** (Pillow for photos, qrcode for QR codes). Open a terminal in the project folder and run:
+   The first build asks a few questions. Let it create the Apple certificates for you (sign in with your Apple Developer account when asked). The build runs in Expo's cloud and takes about 15–30 minutes.
+4. **Send it to TestFlight:**
+   ```
+   npx eas-cli@latest submit --platform ios --latest
+   ```
+5. **Install on your phones.**
+   - Install Apple's **TestFlight** app from the App Store on each iPhone.
+   - In [App Store Connect](https://appstoreconnect.apple.com), open your app, go to **TestFlight**, and add yourself and your wife as testers.
+   - Each of you gets an email invite. Open it on the iPhone, and TestFlight installs **Meal Planner** on the home screen.
+
+**Updating later:** run the `build` and `submit` commands again. TestFlight offers the new version to both phones.
+
+**Publishing to the App Store** uses the same builds; submit one for review in App Store Connect. Before you do:
+- set up your own email sending (step 1.4);
+- add a privacy policy page. The app stores each person's email address and the family's meals.
+
+### 3. Run the desktop app
+
+1. In a terminal in the project folder, install the two Python libraries it uses:
    ```
    python -m pip install -r requirements.txt
    ```
-4. **Start the app**: double-click **`meal_planner.pyw`**. From a terminal, run `python meal_planner.pyw` (on Mac/Linux use `python3`).
+2. Double-click **`meal_planner.pyw`**, or run `python meal_planner.pyw`.
 
-The first launch downloads TheMealDB's recipe list. It takes about 40 seconds and a progress message shows at the bottom. After that the app opens instantly, and it quietly refreshes the list once a week.
+Recipes load live from TheMealDB when the app opens (a second or two). Your data is saved next to the app in `meal_data.json`.
 
-Your data is saved next to the app in `meal_data.json`.
+### 4. Create your family and invite people
 
-### 2. Put the phone app online
+On whichever device has the meals you want to keep (usually the desktop, if you've been using it):
 
-The phone app is the `docs/` folder of this repo, published for free with GitHub Pages. You only need to do this once. Everyone can use the same published copy.
+1. **Sign in.**
+   - **iPhone:** open the **Family** tab.
+   - **Desktop:** click **⇅ Family** at the top.
 
-1. On GitHub, open this repo and go to **Settings → Pages**.
-2. Under **Build and deployment**, set **Source** to **Deploy from a branch**.
-3. Pick branch **`main`** and folder **`/docs`**, then click **Save**.
-4. After a minute or two, the app is live at:
-   **`https://toxiicxmonster.github.io/Meal-Planner/`**
+   Enter your email and tap **Email me a code**, then type in the 6-digit code from the email.
+2. **Start a family.** Tap **Start a family**, give it a name (e.g. *The McCrearys*) and your first name. Your current meals, favorites and list become the family's.
+3. **Invite someone.**
+   - Tap **Invite someone**. You get a code like **`XY3T-78JV`**, which works for 7 days.
+   - The iPhone app opens the share sheet so you can text it; the desktop has **Copy invite message**.
+4. **On the other person's phone:**
+   - open the **Family** tab;
+   - sign in with their own email;
+   - tap **Join a family** and enter the code.
 
-> If you fork this project, your address will be `https://<your-username>.github.io/<repo-name>/`. Change `PHONE_APP_URL` near the top of `meal_planner.pyw` to match, so the desktop's setup QR code points at your copy.
+   Their phone takes the family's week plan. Anything they'd already saved (favorites, list items) is added to the family's.
 
-The phone app works without sync as well. Your meals are then saved only on that phone.
-
-### 3. Connect sync on the desktop
-
-Sync keeps your favorites, week plans, last-week history, filters and shopping list the same on every device. It works through a file called `data.json` in a **private** GitHub repo that only you can see, so you need a free [GitHub account](https://github.com/signup).
-
-In the desktop app, click **⇅ Sync off** at the top left. The window walks you through these three steps.
-
-1. **Create a private repo for your data.**
-   - Click **Create repo on GitHub**. The name `meal-planner-data` and **Private** are filled in for you.
-   - Click **Create repository**. Leave it empty; the app fills it in.
-2. **Create a token that can only use that repo.** A token is like a password just for this app. Click **Create token on GitHub**, then set:
-   - **Token name**: `Meal Planner`
-   - **Expiration**: **1 year**, or custom and longer. The default is 30 days, and sync stops when the token expires.
-   - **Repository access**: **Only select repositories** → pick `meal-planner-data`
-   - **Permissions → Repository permissions → Contents**: **Read and write**. Leave everything else as it is.
-
-   Click **Generate token** and copy it. GitHub only shows it once.
-3. **Connect.**
-   - Enter the repo as `your-username/meal-planner-data`, paste the token, and click **Connect & sync**.
-   - The status line should read **"Connected to … — last synced …"**, and the top bar should show **✓ Synced**.
-
-The token is saved only on this computer, in `sync_config.json`, which is never committed to git. For your privacy, the app won't sync with a public repo.
-
-### 4. Set up your phone
-
-Once sync is connected, the desktop's Sync window shows a **QR code**.
-
-1. Point your phone's camera at the QR code and tap the link. The phone app opens already connected.
-2. Add it to your home screen, so it opens like a regular app and works offline:
-   - **iPhone** (use **Safari**): tap **Share** → **Add to Home Screen**.
-   - **Android** (**Chrome**): tap **⋮** → **Install app** (or **Add to Home screen**).
-3. **iPhone only:** home-screen apps on iPhone keep their own storage, separate from Safari. If the app says **⇅ Sync off** when you open it from the home screen:
-   - tap **⇅ Sync off**;
-   - paste into **Setup code**; the code was copied when you scanned the QR code;
-   - tap **Connect**.
-
-   If nothing was copied, open the app in Safari again (where you scanned it; it's connected there). Tap **✓ Synced**, then **Copy setup code**, then paste it into the home-screen app.
-
-> Keep the QR code and setup code private. They contain your sync token.
-
-The first time you open **Explore** on the phone, it downloads the recipe list (about 40 seconds). After that, recipes and the photos you've viewed work offline.
+Everyone in the family now shares the same week, favorites, shopping list and settings.
 
 ---
 
@@ -108,61 +133,72 @@ The first time you open **Explore** on the phone, it downloads the recipe list (
 - On **This Week**, choose where meals come from: *Favorites only*, *Mix of both* or *Explore only*. Then tap **Shuffle week**.
 - **Swap** a day you don't like, or **Choose** a specific favorite for it. **Keep** holds a day when you shuffle again.
 
-**Sides.**
-- **+ Random side** picks a side dish for the day. Favorites tagged **Side** are used first.
-- **Pick** lets you choose from your favorites tagged **Side**. Tag a meal as a side on the Favorites page.
+**Sides.** **Random side** picks a side for the day (favorites tagged **Side** first). **Pick a side** lets you choose from your favorites tagged **Side**.
 
 **Shopping.**
-- Tap **Shopping** on This Week to add the whole week's ingredients, or open any recipe and add its ingredients from there. Untick anything you already have.
-- On the **List** tab, you can type extra items ("2 lemons"), tap items to check them off, and **Clear checked** when you're done.
+- Tap the **cart** button on This Week to add the whole week's ingredients, or open any recipe and add its ingredients from there. Untick anything you already have.
+- On the **List** tab, type extra items ("2 lemons"), tap items to check them off, and **Clear** the ones in the cart when you're done.
 
 **Favorites.**
-- Tap **♡ Save** on any recipe to add it.
-- Tap **+** on the phone, or **+ Add a meal** on the desktop, to add your own meal. You can include a photo link, recipe link and notes.
+- Tap **Save** on any recipe, or **+** to add your own meal. You can include a photo link, recipe link and notes.
 - Tap a meal's **Breakfast / Lunch / Dinner / Side** tags to sort it. Only meals tagged **Dinner** are used when shuffling the week.
 
-**Explore filters.** *Leave out* also applies to Explore meals and sides picked for your week, but never to your Favorites.
-
-**New weeks.**
-- Every Saturday, the current plan moves to **Last week** and a fresh menu is made.
-- To plan early, use **Start next week**.
+**New weeks.** Every Saturday, the current plan moves to **Last week** and a fresh menu is made. To plan early, use **Next week**.
 
 ## How syncing works
 
-- The apps sync when they open, a couple of seconds after each change, and every minute while open.
-- **Favorites and shopping items** merge one by one. If you edit different meals on two devices, both edits are kept. If the same item was changed on both, the most recent change wins. Deleting something on one device deletes it on the other.
-- **The week plan** is treated as one thing: whichever device changed it last wins.
-- With no internet, each app keeps working on its own copy and catches up the next time it can reach GitHub.
+- Changes are saved on the device right away, then shared with the family a moment later.
+- The iPhone app gets other people's changes **live** while it's open. It also checks when opened and every 30 seconds.
+- The desktop and web apps check when opened, after each change, and every minute.
+- **Favorites and shopping items** merge one by one:
+  - two people editing different items: both edits are kept;
+  - two people editing the same item: the latest edit wins;
+  - deleting an item removes it for everyone.
+- **The week plan** is treated as one thing: the latest change to it wins.
+- **Offline:** each app keeps working on its own copy of your week, favorites and list, and catches up when it's back online. Explore and opening new recipes need internet, since recipes come live from TheMealDB. Your favorites keep their full recipes, so they work offline.
+- **Two phones saving at the same moment:** the database accepts one and asks the other to merge and try again, so nothing is overwritten.
 
 ## Troubleshooting
 
 | What you see | What to do |
 |---|---|
-| **⚠ Sync problem: "GitHub didn't accept the token"** | The token expired or was copied incompletely. Create a new one (step 3.2) and connect again on each device. |
-| **"Couldn't find the repo … or the token can't access it"** | Check the repo is written as `username/meal-planner-data`, and that the token's *Repository access* includes that repo. |
-| **"The token isn't allowed to change this repo"** | Edit the token on GitHub and set **Contents** to **Read and write**. |
-| **"That repo is public"** | In the data repo, open **Settings → Danger Zone → Change visibility → Private**. |
-| **Phone link shows a 404 page** | GitHub Pages isn't on yet, or is still publishing. See step 2 and wait a couple of minutes. |
-| **iPhone home-screen app isn't connected** | Paste the setup code in its Sync settings (step 4.3). |
-| **Photos show a colored letter instead** | That meal has no photo link. Add one with **Edit** on Favorites; right-click an image online → *Copy image address*. |
+| **The sign-in email never arrives** | Check spam. Supabase's built-in email only sends to people on your Supabase team, and only 2 per hour. Add them to the team or set up SMTP (step 1.4). |
+| **The email has a link, not a code** | Edit the **Magic Link** email template to include `{{ .Token }}` (step 1.3). |
+| **"Family sharing isn't set up yet"** | Run `python supabase/set_config.py …` (step 1.5), then rebuild the iPhone app or restart the desktop app. |
+| **"That invite code isn't valid or has expired"** | Codes last 7 days. Tap **Invite someone** for a new one. |
+| **"You've been signed out"** | Sign in again on the Family tab. Your meals stay on the device. |
+| **Supabase says the project is paused** | Free projects pause after about a week with no use. Open the project in Supabase and click **Restore**. |
+| **Photos show a colored letter instead** | That meal has no photo link. Add one with **Edit** on Favorites. |
 | **Desktop app won't start: "Missing Pillow"** | Run `python -m pip install -r requirements.txt`. |
 
-To stop syncing, open the Sync window (desktop) or tap the sync button (phone) and choose **Turn off**. Your data stays on the device and in the GitHub repo.
+## Web app (optional)
+
+The `docs/` folder is the same planner as a web page. It can be installed to a phone's home screen and works offline. It's handy for Android phones, or before the iPhone app is set up.
+
+1. On GitHub, open this repo's **Settings → Pages**, set **Source** to **Deploy from a branch**, pick **`main`** and **`/docs`**, and save.
+2. A minute later it's at `https://toxiicxmonster.github.io/Meal-Planner/`.
+3. Open it on the phone.
+   - **iPhone (Safari):** tap **Share → Add to Home Screen**.
+   - **Android (Chrome):** tap **⋮ → Install app**.
+4. Tap **Family** at the top to sign in and join.
 
 ## Files
 
 | File | What it is | In git? |
 |---|---|---|
-| `meal_planner.pyw` | The desktop app | Yes |
-| `docs/` | The phone app, published by GitHub Pages | Yes |
-| `requirements.txt` | Python libraries the desktop app needs | Yes |
-| `meal_data.json` | Your favorites, plans, history, filters and shopping list | **No** (personal) |
-| `sync_config.json` | Your sync repo and token | **No** (secret) |
-| `recipe_catalog.json`, `image_cache/` | Downloaded recipes and photos, rebuilt automatically | No |
+| `mobile/` | The iPhone app (Expo / React Native) | Yes |
+| `meal_planner.pyw`, `requirements.txt` | The desktop app | Yes |
+| `docs/` | The web app, published by GitHub Pages | Yes |
+| `supabase/schema.sql` | Tables, security rules and functions for family sharing | Yes |
+| `supabase/set_config.py`, `supabase/config.json` | Connects the apps to your Supabase project | Yes (the publishable key is public by design) |
+| `meal_data.json` | The desktop's copy of your meals, plans and list | **No** (personal) |
+| `sync_config.json` | The desktop's sign-in | **No** (private) |
+| `image_cache/` | Recipe photos the desktop has shown, kept so they load quickly | No |
 
 ## For developers
 
-- The desktop app is a single Python/Tkinter file. The phone app is plain HTML, CSS and JavaScript with no build step: `docs/core.js` holds the rules and `docs/app.js` holds the screens.
-- The meal rules and the sync merge are implemented twice: in `meal_planner.pyw` and in `docs/core.js`. They must produce identical results. If you change meal types, protein detection, aisles, ingredient matching or `merge_data` / `mergeData`, change both.
-- To test the phone app locally, serve `docs/` from any web server, for example `python -m http.server -d docs`. Then open it in a browser with the window narrowed to phone width.
-- When you change the phone app, bump `VERSION` in `docs/sw.js` so installed copies pick up the update.
+- **Shared rules:** `docs/core.js` holds the planner rules shared by the web and iPhone apps: meal types, proteins, aisles, merging, and the Supabase client. The iPhone app gets a copy in `mobile/src/lib/core.js` through `npm run sync-core`, which also runs automatically on `npm start`. **Edit `docs/core.js`, not the copy.**
+- **Desktop in step:** the desktop app implements the same rules in Python (`merge_data`, `meal_types`, `proteins`, `aisle_of`, `add_to_list`, `Supabase` / `FamilyAccount` / `FamilyStore`). If you change a rule, change both, so every app merges the same way.
+- **iPhone app:** it uses Expo Router (`mobile/src/app/`); the planner state is an external store in `mobile/src/lib/planner.js`. Before committing, run `npx expo lint` and `npx expo-doctor` in `mobile/`.
+- **Trying the iPhone app's screens on a computer:** run `npm run web` in `mobile/`.
+- **Web app updates:** bump `VERSION` in `docs/sw.js` so installed copies pick up the change.

@@ -5,15 +5,15 @@ Pages:
   Explore    - a photo grid of new ideas from TheMealDB (https://www.themealdb.com)
   Favorites  - meals you already know you like; add them by hand or save from Explore
 
-Data is saved to meal_data.json next to this file; photos are cached in image_cache/ and
-TheMealDB's full recipe list is kept in recipe_catalog.json (refreshed weekly).
+Data is saved to meal_data.json next to this file; photos are cached in image_cache/.
+Recipes come live from TheMealDB each time the app opens.
 
-Sync: favorites, plans and settings can sync with the phone app (docs/, served by GitHub Pages)
-through a data.json file in a private GitHub repo. Connection details live in sync_config.json.
+Family sharing: favorites, plans, the shopping list and settings sync with the iPhone app (mobile/),
+the web app (docs/) and other family members through Supabase (see supabase/schema.sql).
+Your project's address is in supabase/config.json; your sign-in is kept in sync_config.json.
 Requires Pillow for photos:  python -m pip install pillow
 """
 
-import base64
 import datetime
 import hashlib
 import io
@@ -51,8 +51,6 @@ except ImportError:
 
 HERE = Path(__file__).parent
 DATA_FILE = HERE / "meal_data.json"
-CATALOG_FILE = HERE / "recipe_catalog.json"
-CATALOG_MAX_AGE_DAYS = 7
 PAGE_SIZE = 100
 CACHE_DIR = HERE / "image_cache"
 API = "https://www.themealdb.com/api/json/v1/1/"
@@ -83,9 +81,7 @@ REGIONS = {
 }
 ALL_CUISINES = "All cuisines"
 SYNC_FILE = HERE / "sync_config.json"
-PHONE_APP_URL = "https://toxiicxmonster.github.io/Meal-Planner/"
-GITHUB_API = "https://api.github.com"
-SYNC_PATH = "data.json"
+SUPABASE_CONFIG = HERE / "supabase" / "config.json"
 SYNC_EVERY_MS = 60_000
 PLAN_KEYS = ("week_start", "week", "kept", "sides")
 SETTINGS_KEYS = ("source", "filters")
@@ -217,85 +213,169 @@ def merge_data(local, remote):
 
 
 class SyncError(Exception):
-    pass
+    def __init__(self, message, status=None, signed_out=False):
+        super().__init__(message)
+        self.status, self.signed_out = status, signed_out
 
 
 class SyncConflict(SyncError):
     pass
 
 
-class GitHubStore:
-    """Reads and writes data.json in a private GitHub repo."""
+def load_supabase_config():
+    try:
+        cfg = json.loads(SUPABASE_CONFIG.read_text(encoding="utf-8"))
+        return cfg.get("url", ""), cfg.get("anonKey", "")
+    except (OSError, ValueError):
+        return "", ""
 
-    def __init__(self, repo, token, api=GITHUB_API):
-        self.repo, self.token, self.api = repo.strip().strip("/"), token.strip(), api
 
-    def _request(self, method, path, body=None):
-        req = urllib.request.Request(
-            f"{self.api}/repos/{self.repo}{path}", method=method,
-            data=json.dumps(body).encode() if body is not None else None,
-            headers={"Authorization": f"Bearer {self.token}", "Accept": "application/vnd.github+json",
-                     "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "MealPlanner",
-                     "Content-Type": "application/json"})
+class Supabase:
+    """Sign-in with an emailed code, and calls to the functions in supabase/schema.sql (same as docs/core.js)."""
+
+    def __init__(self, url, key):
+        self.url, self.key = (url or "").rstrip("/"), key or ""
+
+    @property
+    def configured(self):
+        return bool(self.url and self.key and "YOUR-PROJECT" not in self.url)
+
+    def request(self, path, body, token=None):
+        if not self.configured:
+            raise SyncError("Family sharing isn't set up in this copy of the app yet.")
+        # Publishable keys go only in `apikey`; Authorization carries a signed-in person's token.
+        headers = {"apikey": self.key, "Content-Type": "application/json", "User-Agent": "MealPlanner"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = urllib.request.Request(self.url + path, method="POST", data=json.dumps(body or {}).encode(),
+                                     headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=20) as resp:
-                return json.load(resp)
+                text = resp.read().decode("utf-8")
+                return json.loads(text) if text else None
         except urllib.error.HTTPError as e:
-            if e.code == 401:
-                raise SyncError("GitHub didn't accept the token. Check it was copied fully and hasn't expired.")
-            if e.code in (409, 422) and method == "PUT":
-                raise SyncConflict("The phone saved at the same moment \u2014 trying again.")
-            if e.code == 404:
-                raise
-            if e.code == 403:
-                raise SyncError("The token isn't allowed to change this repo. Give it Contents: Read and write.")
-            raise SyncError(f"GitHub error {e.code}")
+            try:
+                info = json.loads(e.read().decode("utf-8") or "{}")
+            except ValueError:
+                info = {}
+            raise SyncError(info.get("message") or info.get("msg") or f"Server error {e.code}", status=e.code)
         except urllib.error.URLError:
-            raise SyncError("Couldn't reach GitHub \u2014 check your internet connection.")
+            raise SyncError("Couldn't connect \u2014 check your internet connection.")
 
-    def check(self):
+    def send_code(self, email):
         try:
-            info = self._request("GET", "")
-        except urllib.error.HTTPError:
-            raise SyncError(f"Couldn't find the repo \u201c{self.repo}\u201d, or the token can't access it.")
-        if not info.get("private"):
-            raise SyncError("That repo is public, so anyone could see your meals. Make it private first "
-                            "(repo Settings \u2192 Danger Zone \u2192 Change visibility).")
-        return info
+            self.request("/auth/v1/otp", {"email": email.strip(), "create_user": True})
+        except SyncError as e:
+            if e.status == 429:
+                raise SyncError("Too many codes requested \u2014 wait a minute and try again.")
+            if e.status in (400, 422):
+                raise SyncError("That email address doesn't look right.")
+            raise
+
+    def verify_code(self, email, code):
+        try:
+            r = self.request("/auth/v1/verify", {"type": "email", "email": email.strip(), "token": "".join(code.split())})
+        except SyncError as e:
+            if e.status and e.status < 500:
+                raise SyncError("That code didn't work. Check it, or send a new one.")
+            raise
+        return self.to_session(r)
+
+    def refresh(self, session):
+        try:
+            r = self.request("/auth/v1/token?grant_type=refresh_token", {"refresh_token": session["refresh_token"]})
+        except SyncError as e:
+            if e.status and e.status < 500:
+                raise SyncError("You've been signed out. Please sign in again.", signed_out=True)
+            raise
+        return self.to_session(r)
+
+    @staticmethod
+    def to_session(r):
+        user = r.get("user") or {}
+        return {"access_token": r["access_token"], "refresh_token": r["refresh_token"],
+                "expires_at": now_ms() + int(r.get("expires_in") or 3600) * 1000,
+                "email": user.get("email", ""), "user_id": user.get("id", "")}
+
+
+class FamilyAccount:
+    """One signed-in person's connection. get/set store the session wherever the app keeps it."""
+
+    def __init__(self, sb, get_session, set_session):
+        self.sb, self.get, self.set = sb, get_session, set_session
+
+    def token(self):
+        session = self.get()
+        if not session:
+            raise SyncError("Please sign in first.", signed_out=True)
+        if session["expires_at"] - now_ms() < 60000:
+            fresh = self.sb.refresh(session)
+            fresh["email"] = fresh["email"] or session.get("email", "")
+            self.set(fresh)
+            session = fresh
+        return session["access_token"]
+
+    def call(self, name, args=None):
+        try:
+            return self.sb.request("/rest/v1/rpc/" + name, args or {}, self.token())
+        except SyncError as e:
+            if e.status == 401 and self.get():  # token expired early: refresh once and retry
+                self.set(dict(self.get(), expires_at=0))
+                return self.sb.request("/rest/v1/rpc/" + name, args or {}, self.token())
+            raise
+
+    def my_families(self):
+        return self.call("my_families")
+
+    def create_family(self, name, display_name):
+        return self.call("create_family", {"p_name": name, "p_display_name": display_name})
+
+    def create_invite(self, family_id):
+        return self.call("create_invite", {"p_family": family_id})
+
+    def join_family(self, code, display_name):
+        return self.call("join_family", {"p_code": code, "p_display_name": display_name})
+
+    def leave_family(self, family_id):
+        return self.call("leave_family", {"p_family": family_id})
+
+    def remove_member(self, family_id, user_id):
+        return self.call("remove_member", {"p_family": family_id, "p_user": user_id})
+
+
+class FamilyStore:
+    """The family's shared planner, read and saved with a version check (like docs/core.js)."""
+
+    def __init__(self, account, family_id):
+        self.account, self.family_id = account, family_id
 
     def pull(self):
-        """Returns (data or None if nothing saved yet, sha)."""
-        try:
-            got = self._request("GET", f"/contents/{SYNC_PATH}")
-        except urllib.error.HTTPError:
-            return None, None
-        return json.loads(base64.b64decode(got["content"]).decode("utf-8")), got["sha"]
+        r = self.account.call("get_family_data", {"p_family": self.family_id})
+        return (r["doc"] or None), r["version"]
 
-    def push(self, data, sha):
-        body = {"message": "Sync from desktop",
-                "content": base64.b64encode(canonical(data).encode("utf-8")).decode()}
-        if sha:
-            body["sha"] = sha
-        try:
-            return self._request("PUT", f"/contents/{SYNC_PATH}", body)["content"]["sha"]
-        except urllib.error.HTTPError:
-            raise SyncError(f"Couldn't find the repo \u201c{self.repo}\u201d, or the token can't access it.")
+    def push(self, data, version):
+        r = self.account.call("put_family_data", {"p_family": self.family_id, "p_doc": data,
+                                                  "p_expected_version": version or 0})
+        if not r["ok"]:
+            raise SyncConflict("Saved at the same moment on another phone \u2014 trying again.")
+        return r["version"]
+
+
+def format_invite_code(code):
+    c = "".join(ch for ch in (code or "").upper() if ch.isalnum())
+    return c[:4] + "-" + c[4:] if len(c) == 8 else c
 
 
 def load_sync_config():
     try:
-        return json.loads(SYNC_FILE.read_text(encoding="utf-8"))
+        cfg = json.loads(SYNC_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
+    return cfg if "session" in cfg or "family" in cfg else {}  # drop old GitHub sync settings
 
 
 def save_sync_config(cfg):
     SYNC_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-
-
-def phone_setup_link(cfg):
-    payload = json.dumps({"repo": cfg["repo"], "token": cfg["token"]}, separators=(",", ":"))
-    return PHONE_APP_URL + "#setup=" + base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
 
 
 def qr_photo(text, target=250):
@@ -308,23 +388,6 @@ def qr_photo(text, target=250):
     img = qr.make_image(fill_color="black", back_color="white").get_image().convert("RGB")
     scale = max(3, target // img.width)  # whole-pixel scaling keeps the code crisp for phone cameras
     return ImageTk.PhotoImage(img.resize((img.width * scale, img.height * scale), Image.NEAREST))
-
-
-def load_catalog():
-    """Returns (meals, is_fresh). Meals is [] if the catalog has never been downloaded."""
-    try:
-        cat = json.loads(CATALOG_FILE.read_text(encoding="utf-8"))
-        if cat["meals"] and "parts" not in cat["meals"][0]:
-            return [], False  # saved by an older version: download again for shopping-list ingredients
-        age = datetime.date.today() - datetime.date.fromisoformat(cat["date"])
-        return cat["meals"], age.days < CATALOG_MAX_AGE_DAYS
-    except (OSError, ValueError, KeyError):
-        return [], False
-
-
-def save_catalog(meals):
-    CATALOG_FILE.write_text(json.dumps({"date": datetime.date.today().isoformat(), "meals": meals}),
-                            encoding="utf-8")
 
 
 def save_data(data):
@@ -367,17 +430,37 @@ def parse_meal(m):
     }
 
 
-def fetch_catalog(progress):
-    """Download every TheMealDB recipe, one first letter at a time (their search caps other queries at 25).
-    Calls progress(done, total) from the worker thread."""
-    letters = "abcdefghijklmnopqrstuvwxyz0123456789"
-    meals = {}
-    for i, ch in enumerate(letters):
-        for m in api_get("search.php", f=ch):
-            meals[m["idMeal"]] = parse_meal(m)
-        progress(i + 1, len(letters))
-        time.sleep(0.25)
-    return sorted(meals.values(), key=lambda m: m["name"].lower())
+CATEGORIES = ["Beef", "Breakfast", "Chicken", "Dessert", "Goat", "Lamb", "Miscellaneous", "Pasta", "Pork",
+              "Seafood", "Side", "Starter", "Vegan", "Vegetarian"]
+
+
+def fetch_index():
+    """Every TheMealDB recipe's name, photo, category and cuisine, fetched live (a second or two).
+    Ingredients and instructions come per recipe from fetch_by_ids(). Same as fetchIndex() in docs/core.js."""
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        lists = list(pool.map(lambda c: api_get("filter.php", c=c), CATEGORIES))
+    by_id = {}
+    for category, items in zip(CATEGORIES, lists):
+        for m in items:
+            area = m.get("strArea") or ""
+            by_id[m["idMeal"]] = {"id": m["idMeal"], "name": m["strMeal"], "thumb": m.get("strMealThumb") or "",
+                                  "category": category, "area": AREA_FIX.get(area, area)}
+    return sorted(by_id.values(), key=lambda m: m["name"].lower())
+
+
+def search_ingredient(term):
+    """Ids of recipes that use an ingredient, from TheMealDB's ingredient search ("garlic", "chicken breast")."""
+    key = "_".join(term.strip().lower().split())
+    if len(key) < 3:
+        return set()
+    tries = [key, key[:-1]] if key.endswith("s") and len(key) > 3 else [key]
+    ids = set()
+    for k in tries:
+        try:
+            ids.update(m["idMeal"] for m in api_get("filter.php", i=k))
+        except (urllib.error.URLError, ValueError):
+            pass
+    return ids
 
 
 # ---------------------------------------------------------------- meal types & proteins
@@ -808,6 +891,8 @@ class MealPlanner(tk.Tk):
         self.stamp()
         save_data(self.data)
         self.sync_cfg = load_sync_config()
+        self.sb = Supabase(*load_supabase_config())
+        self.account = FamilyAccount(self.sb, lambda: self.sync_cfg.get("session"), self.set_session)
         self.sync_job = None
         self.sync_running = False
         self.sync_again = False
@@ -815,9 +900,11 @@ class MealPlanner(tk.Tk):
         self.ui_queue = queue.Queue()
         self.images = ImageLoader(self)
         self.save_buttons = []  # (button, meal name) pairs to update when Favorites change
-        self.catalog, catalog_fresh = load_catalog()
-        self.catalog_by_id = {m["id"]: m for m in self.catalog}
-        self.catalog_waiting = None  # callbacks to run once a catalog download finishes
+        self.catalog, self.catalog_by_id = [], {}  # recipe names/photos/categories, loaded live
+        self.details = {}  # full recipes fetched live, by id
+        self.catalog_waiting = None  # callbacks to run once the recipe list has loaded
+        self.catalog_failed = False
+        self.ingredient_hits = ("", set())
         self.explore_order = self.shuffled_ids()
         self.explore_limit = PAGE_SIZE
         self.search_job = None
@@ -856,10 +943,7 @@ class MealPlanner(tk.Tk):
         self.refresh_shopping()
         self.show_page("week")
 
-        if not self.catalog:
-            self.ensure_catalog()
-        elif not catalog_fresh:
-            self.ensure_catalog(quiet=True)  # refresh last week's list in the background
+        self.ensure_catalog(quiet=True)  # recipe names and photos, live
         self.backfill_photos()
 
     # ------------------------------------------------------------ plumbing
@@ -899,8 +983,12 @@ class MealPlanner(tk.Tk):
 
     # ------------------------------------------------------------ sync
 
+    def set_session(self, session):
+        self.sync_cfg["session"] = session
+        save_sync_config(self.sync_cfg)
+
     def sync_ready(self):
-        return bool(self.sync_cfg.get("repo") and self.sync_cfg.get("token"))
+        return bool(self.sync_cfg.get("session") and self.sync_cfg.get("family"))
 
     def schedule_sync(self, delay=2000):
         if not self.sync_ready():
@@ -926,7 +1014,7 @@ class MealPlanner(tk.Tk):
         self.sync_job = None
         self.sync_running = True
         self.set_sync_status("syncing")
-        store = GitHubStore(self.sync_cfg["repo"], self.sync_cfg["token"])
+        store = FamilyStore(self.account, self.sync_cfg["family"]["family_id"])
 
         def pulled(result, error):
             if error:
@@ -948,6 +1036,13 @@ class MealPlanner(tk.Tk):
 
     def _sync_finished(self, error):
         self.sync_running = False
+        if error and getattr(error, "signed_out", False):
+            self.sign_out()
+            self.notify("You've been signed out — click Family at the top to sign in again")
+        elif error and "not in this family" in str(error):
+            self.sync_cfg.pop("family", None)
+            save_sync_config(self.sync_cfg)
+            self.notify("You're no longer in that family. Your meals are still on this computer.")
         if self.sync_ready():
             if error:
                 self.set_sync_status("error", str(error))
@@ -983,14 +1078,15 @@ class MealPlanner(tk.Tk):
     def set_sync_status(self, state, detail=""):
         self.sync_state, self.sync_detail = state, detail
         text, color = {
-            "off": ("\u21c5  Sync off", MUTED),
+            "off": ("\u21c5  Family", MUTED),
             "syncing": ("\u21c5  Syncing\u2026", MUTED),
             "ok": ("\u2713  Synced", GREEN),
             "error": ("\u26a0  Sync problem", ACCENT_DARK),
         }[state]
         self.sync_chip.config(text=text, fg=color)
-        tip = detail or {"off": "Set up syncing with your phone", "syncing": "Syncing with your phone\u2026",
-                         "ok": "Your favorites and plans are synced with your phone"}.get(state, "")
+        tip = detail or {"off": "Share your plan, favorites and list with your family",
+                         "syncing": "Syncing with your family\u2026",
+                         "ok": "Your plan, favorites and list are synced with your family"}.get(state, "")
         self.sync_tooltip.text = tip
         if getattr(self, "sync_status_label", None) and self.sync_status_label.winfo_exists():
             self.sync_status_label.config(text=self.sync_status_text(), fg=color)
@@ -1002,116 +1098,174 @@ class MealPlanner(tk.Tk):
             return "Syncing\u2026"
         if self.sync_state == "ok":
             when = datetime.datetime.fromtimestamp(self.sync_cfg.get("last_sync", now_ms()) / 1000)
-            return f"Connected to {self.sync_cfg['repo']} \u2014 last synced {when:%I:%M %p}".replace(" 0", " ")
-        return "Not connected yet."
+            return f"Synced at {when:%I:%M %p}".replace(" 0", " ")
+        return "Not synced yet."
+
+    def sign_out(self):
+        self.sync_cfg = {}
+        save_sync_config({})
+        self.set_sync_status("off")
 
     def sync_dialog(self):
+        """The Family window: sign in -> join or start a family -> members and invites."""
         win = tk.Toplevel(self, bg=CARD)
-        win.title("Sync with your phone")
+        win.title("Family")
         win.transient(self)
         win.resizable(False, False)
-        win.geometry(f"+{self.winfo_rootx() + 220}+{self.winfo_rooty() + 50}")
+        win.geometry(f"+{self.winfo_rootx() + 300}+{self.winfo_rooty() + 60}")
         win.bind("<Escape>", lambda e: win.destroy())
-        frm = tk.Frame(win, bg=CARD, padx=24, pady=20)
+        frm = tk.Frame(win, bg=CARD, padx=24, pady=20, width=460)
         frm.pack(fill="both", expand=True)
-        left = tk.Frame(frm, bg=CARD)
-        left.pack(side="left", fill="y")
-        tk.Label(left, text="Sync with your phone", bg=CARD, fg=TEXT, font=(F, 15, "bold")).pack(anchor="w")
-        tk.Label(left, text="Your favorites, weekly plans and filters are kept in a private GitHub repo that\n"
-                            "only you can see. The desktop and phone apps both sync through it.",
-                 bg=CARD, fg=MUTED, font=(F, 9), justify="left").pack(anchor="w", pady=(2, 12))
+        state = {"email": None, "invite": None, "error": None}
 
-        def step(num, title, detail, link_text, url):
-            row = tk.Frame(left, bg=CARD)
-            row.pack(fill="x", pady=4)
-            tk.Label(row, text=str(num), bg=ACCENT, fg="white", font=(F, 10, "bold"), width=2).pack(
-                side="left", anchor="n", padx=(0, 10))
-            box = tk.Frame(row, bg=CARD)
-            box.pack(side="left", fill="x", expand=True)
-            tk.Label(box, text=title, bg=CARD, fg=TEXT, font=(F, 10, "bold")).pack(anchor="w")
-            if detail:
-                tk.Label(box, text=detail, bg=CARD, fg=MUTED, font=(F, 9), justify="left").pack(anchor="w")
-            if url:
-                button(box, link_text, lambda: webbrowser.open(url), "soft", small=True).pack(anchor="w", pady=(4, 0))
+        def entry(parent, label, width=34, big=False):
+            tk.Label(parent, text=label, bg=CARD, fg=TEXT, font=(F, 10, "bold")).pack(anchor="w", pady=(10, 4))
+            var = tk.StringVar()
+            e = tk.Entry(parent, textvariable=var, width=width, relief="flat", bg=GHOST,
+                         font=(F, 16, "bold") if big else (F, 11), highlightthickness=1,
+                         highlightbackground=BORDER, highlightcolor=ACCENT)
+            e.pack(anchor="w", ipady=5, fill="x")
+            return var, e
 
-        step(1, "Create a private repo for your data", "Keep the name meal-planner-data and leave it Private.",
-             "Create repo on GitHub \u2197",
-             "https://github.com/new?name=meal-planner-data&visibility=private"
-             "&description=Meal+Planner+sync+data")
-        step(2, "Create a token that can only use that repo",
-             "Name it Meal Planner, Expiration: 1 year \u2192 Only select repositories \u2192 meal-planner-data\n"
-             "\u2192 Permissions: Contents \u2192 Read and write \u2192 Generate token, then copy it.",
-             "Create token on GitHub \u2197", "https://github.com/settings/personal-access-tokens/new")
-        step(3, "Paste them here and connect", "", "", None)
+        def run(work, done=None):
+            """Do a network step in the background, then redraw the window (showing any error)."""
+            def finished(result, error):
+                state["error"] = str(error) if error else None
+                if not error and done:
+                    done(result)
+                if win.winfo_exists():
+                    draw()
+            self.background(work, finished)
 
-        form = tk.Frame(left, bg=CARD)
-        form.pack(fill="x", padx=(34, 0))
-        fields = {}
-        for row, (key, label, hide) in enumerate([("repo", "Repo", False), ("token", "Token", True)]):
-            tk.Label(form, text=label, bg=CARD, fg=TEXT, font=(F, 10, "bold")).grid(
-                row=row, column=0, sticky="w", pady=4, padx=(0, 10))
-            var = tk.StringVar(value=self.sync_cfg.get(key, ""))
-            tk.Entry(form, textvariable=var, width=40, relief="flat", font=(F, 10), bg=GHOST, show="\u2022" if hide else "",
-                     highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT).grid(
-                row=row, column=1, sticky="we", pady=4, ipady=4)
-            fields[key] = var
-        tk.Label(form, text="Repo looks like yourname/meal-planner-data", bg=CARD, fg=MUTED,
-                 font=(F, 8)).grid(row=2, column=1, sticky="w")
+        def enter_family(family, joining):
+            if joining:  # a newly joined computer takes the family's week plan and settings
+                self.data["plan_updated"] = 0
+                self.data["settings_updated"] = 0
+            self.sync_cfg["family"] = family
+            save_sync_config(self.sync_cfg)
+            self.sync_now(then=lambda: (self.roll_over_week(), win.winfo_exists() and draw()))
 
-        self.sync_status_label = tk.Label(left, text=self.sync_status_text(), bg=CARD, font=(F, 9, "bold"),
-                                          wraplength=460, justify="left", fg=MUTED)
-        self.sync_status_label.pack(anchor="w", pady=(10, 0), padx=(34, 0))
-        btns = tk.Frame(left, bg=CARD)
-        btns.pack(anchor="w", pady=(10, 0), padx=(34, 0))
-
-        phone = tk.Frame(frm, bg=CARD)
-
-        def show_phone():
-            for w in phone.winfo_children():
+        def draw():
+            for w in frm.winfo_children():
                 w.destroy()
-            if not self.sync_ready():
-                return phone.pack_forget()
-            phone.pack(side="left", fill="y", padx=(28, 0))
-            tk.Label(phone, text="Set up your phone", bg=CARD, fg=TEXT, font=(F, 12, "bold")).pack(anchor="w")
-            photo = qr_photo(phone_setup_link(self.sync_cfg), 230)
-            if photo:
-                img = tk.Label(phone, image=photo, bg=CARD)
-                img.image = photo
-                img.pack(pady=8)
-            tk.Label(phone, bg=CARD, fg=MUTED, font=(F, 9), justify="left", wraplength=250, text=(
-                "Scan with your phone's camera. The app opens already connected.\n\n"
-                "Then add it to your home screen:\n"
-                "\u2022 iPhone (Safari): Share \u2192 Add to Home Screen\n"
-                "\u2022 Android (Chrome): \u22ee \u2192 Install app\n\n"
-                "Keep this code private \u2014 it contains your sync key.")).pack(anchor="w")
+            tk.Label(frm, text="Family", bg=CARD, fg=TEXT, font=(F, 16, "bold")).pack(anchor="w")
+            tk.Label(frm, text="Share one week plan, favorites and shopping list with your family.",
+                     bg=CARD, fg=MUTED, font=(F, 9)).pack(anchor="w", pady=(0, 6))
+            session, family = self.sync_cfg.get("session"), self.sync_cfg.get("family")
+            if not self.sb.configured:
+                tk.Label(frm, bg=CARD, fg=TEXT, font=(F, 10), justify="left", wraplength=420, text=(
+                    "Family sharing isn't set up in this copy of the app yet.\n\n"
+                    "Set it up by following \u201cSet up family sharing\u201d in README.md, then restart the app.")).pack(anchor="w")
+            elif not session and not state["email"]:
+                var, e = entry(frm, "Your email")
+                e.focus_set()
+                tk.Label(frm, text="No password needed \u2014 we'll email you a 6-digit code.", bg=CARD, fg=MUTED,
+                         font=(F, 9)).pack(anchor="w", pady=(4, 0))
+                button(frm, "Email me a code", lambda: run(lambda: self.sb.send_code(var.get()),
+                                                         lambda _: state.update(email=var.get().strip()))
+                       ).pack(anchor="w", pady=(12, 0))
+            elif not session:
+                tk.Label(frm, text=f"We sent a code to {state['email']}.", bg=CARD, fg=TEXT, font=(F, 10)).pack(anchor="w")
+                var, e = entry(frm, "Code", width=12, big=True)
+                e.focus_set()
 
-        def connect():
-            cfg = {"repo": fields["repo"].get().strip(), "token": fields["token"].get().strip()}
-            if not cfg["repo"] or "/" not in cfg["repo"] or not cfg["token"]:
-                return self.sync_status_label.config(text="Enter the repo (yourname/meal-planner-data) and token.",
-                                                     fg=ACCENT_DARK)
-            self.sync_status_label.config(text="Checking\u2026", fg=MUTED)
+                def signed_in(sess):
+                    self.set_session(sess)
+                    state["email"] = None
+                    families = self.account.my_families()
+                    if families:
+                        self.after(0, lambda: enter_family(families[0], True))
+                row = tk.Frame(frm, bg=CARD)
+                row.pack(anchor="w", pady=(12, 0))
+                button(row, "Sign in", lambda: run(lambda: self.sb.verify_code(state["email"], var.get()),
+                                                   lambda sess: self.background(lambda: signed_in(sess), lambda *_: draw()))
+                       ).pack(side="left")
+                button(row, "Send a new code", lambda: run(lambda: self.sb.send_code(state["email"])), "ghost").pack(side="left", padx=8)
+                button(row, "Different email", lambda: (state.update(email=None), draw()), "ghost").pack(side="left")
+            elif not family:
+                tk.Label(frm, text=f"Signed in as {session.get('email', '')}", bg=CARD, fg=MUTED, font=(F, 9)).pack(anchor="w")
+                tk.Label(frm, text="Join with an invite code", bg=CARD, fg=ACCENT_DARK, font=(F, 11, "bold")).pack(anchor="w", pady=(10, 0))
+                code, _ = entry(frm, "Invite code", width=14, big=True)
+                name, _ = entry(frm, "Your name")
+                button(frm, "Join family", lambda: run(lambda: self.account.join_family(code.get(), name.get()),
+                                                       lambda fam: enter_family(fam, True))).pack(anchor="w", pady=(10, 0))
+                tk.Label(frm, text="Or start a family", bg=CARD, fg=ACCENT_DARK, font=(F, 11, "bold")).pack(anchor="w", pady=(18, 0))
+                fam_name, _ = entry(frm, "Family name")
+                name2, _ = entry(frm, "Your name")
+                button(frm, "Start family", lambda: run(lambda: self.account.create_family(fam_name.get(), name2.get()),
+                                                        lambda fam: enter_family(fam, False)), "soft").pack(anchor="w", pady=(10, 0))
+                button(frm, "Sign out", lambda: (self.sign_out(), draw()), "ghost", small=True).pack(anchor="w", pady=(16, 0))
+            else:
+                owner = family.get("role") == "owner"
+                tk.Label(frm, text=family["name"], bg=CARD, fg=TEXT, font=(F, 13, "bold")).pack(anchor="w", pady=(4, 0))
+                self.sync_status_label = tk.Label(frm, text=self.sync_status_text(), bg=CARD, font=(F, 9, "bold"),
+                                                  fg=ACCENT_DARK if self.sync_state == "error" else GREEN,
+                                                  wraplength=420, justify="left")
+                self.sync_status_label.pack(anchor="w")
+                tk.Label(frm, text="MEMBERS", bg=CARD, fg=MUTED, font=(F, 9, "bold")).pack(anchor="w", pady=(12, 4))
 
-            def checked(_, error):
-                if error:
-                    return self.sync_status_label.config(text=str(error), fg=ACCENT_DARK)
-                self.sync_cfg = cfg
-                save_sync_config(cfg)
-                self.sync_now(then=lambda: win.winfo_exists() and show_phone())
-            self.background(GitHubStore(cfg["repo"], cfg["token"]).check, checked)
+                def remove(uid, who):
+                    if messagebox.askyesno("Remove", f"Remove {who} from the family?", parent=win):
+                        run(lambda: self.account.remove_member(family["family_id"], uid),
+                            lambda fam: (self.sync_cfg.update(family=fam), save_sync_config(self.sync_cfg)))
 
-        def disconnect():
-            if messagebox.askyesno("Turn off sync", "Stop syncing with your phone?\n\nYour data stays on this "
-                                   "computer and in the GitHub repo.", parent=win):
-                self.sync_cfg = {}
-                save_sync_config({})
-                self.set_sync_status("off")
-                show_phone()
+                for m in family.get("members", []):
+                    row = tk.Frame(frm, bg=CARD)
+                    row.pack(fill="x", pady=2)
+                    label = (m.get("display_name") or "(no name)") + ("  (you)" if m.get("me") else "")
+                    tk.Label(row, text=label, bg=CARD, fg=TEXT, font=(F, 10)).pack(side="left")
+                    if m.get("role") == "owner":
+                        tk.Label(row, text="Owner", bg=CARD, fg=ACCENT_DARK, font=(F, 9, "bold")).pack(side="left", padx=8)
+                    if owner and not m.get("me"):
+                        x = tk.Label(row, text="Remove", bg=CARD, fg=MUTED, font=(F, 9, "underline"), cursor="hand2")
+                        x.pack(side="right")
+                        x.bind("<Button-1>", lambda e, uid=m["user_id"], who=m.get("display_name") or "this person":
+                               remove(uid, who))
+                if state["invite"]:
+                    box = tk.Frame(frm, bg=ACCENT_SOFT, padx=14, pady=10)
+                    box.pack(fill="x", pady=(12, 0))
+                    tk.Label(box, text="INVITE CODE", bg=ACCENT_SOFT, fg=ACCENT_DARK, font=(F, 8, "bold")).pack()
+                    tk.Label(box, text=format_invite_code(state["invite"]), bg=ACCENT_SOFT, fg=TEXT,
+                             font=(F, 22, "bold")).pack()
+                    tk.Label(box, text="Works for 7 days. They enter it on the app's Family tab after signing in.",
+                             bg=ACCENT_SOFT, fg=MUTED, font=(F, 8)).pack()
 
-        button(btns, "Connect & sync", connect).pack(side="left")
-        button(btns, "Sync now", lambda: self.sync_now(), "ghost").pack(side="left", padx=8)
-        button(btns, "Turn off", disconnect, "ghost").pack(side="left")
-        show_phone()
+                    def copy_invite():
+                        self.clipboard_clear()
+                        self.clipboard_append(f"Join our family on Meal Planner! Open the app, go to Family and enter "
+                                              f"this invite code: {format_invite_code(state['invite'])} (works for 7 days).")
+                        self.notify("Invite copied \u2014 paste it in a text or message")
+                    button(box, "Copy invite message", copy_invite, "primary", small=True).pack(pady=(6, 0))
+                row = tk.Frame(frm, bg=CARD)
+                row.pack(anchor="w", pady=(12, 0))
+                button(row, "Invite someone", lambda: run(lambda: self.account.create_invite(family["family_id"]),
+                                                          lambda inv: state.update(invite=inv["code"]))).pack(side="left")
+                button(row, "Sync now", lambda: self.sync_now(then=lambda: win.winfo_exists() and draw()), "ghost").pack(side="left", padx=8)
+                row2 = tk.Frame(frm, bg=CARD)
+                row2.pack(anchor="w", pady=(14, 0))
+
+                def leave():
+                    if messagebox.askyesno("Leave family", "Leave this family? Your meals stay on this computer.", parent=win):
+                        run(lambda: self.account.leave_family(family["family_id"]),
+                            lambda _: (self.sync_cfg.pop("family", None), save_sync_config(self.sync_cfg), self.set_sync_status("off")))
+                button(row2, "Leave family", leave, "ghost", small=True).pack(side="left")
+                button(row2, "Sign out", lambda: (self.sign_out(), draw()), "ghost", small=True).pack(side="left", padx=8)
+                tk.Label(frm, text=f"Signed in as {session.get('email', '')}", bg=CARD, fg=MUTED, font=(F, 8)).pack(anchor="w", pady=(8, 0))
+            if state["error"]:
+                tk.Label(frm, text=state["error"], bg=CARD, fg=ACCENT_DARK, font=(F, 9, "bold"), wraplength=420,
+                         justify="left").pack(anchor="w", pady=(10, 0))
+
+        draw()
+        if self.sync_ready():  # refresh the member list
+            def got(families, error):
+                fam_id = self.sync_cfg.get("family", {}).get("family_id")
+                mine = next((f for f in families or [] if f["family_id"] == fam_id), None) if not error else None
+                if mine:
+                    self.sync_cfg["family"] = mine
+                    save_sync_config(self.sync_cfg)
+                if win.winfo_exists():
+                    draw()
+            self.background(self.account.my_families, got)
         win.grab_set()
 
     def call_on_ui(self, fn):
@@ -1200,47 +1354,64 @@ class MealPlanner(tk.Tk):
         return ids
 
     def ensure_catalog(self, then=None, quiet=False):
-        """Make sure the full recipe list is downloaded, then call `then`."""
-        if self.catalog and not quiet:
+        """Load the list of recipes live from TheMealDB (a second or two), then call `then`."""
+        if self.catalog:
             return then and then()
-        if self.catalog_waiting is not None:  # already downloading
+        if self.catalog_waiting is not None:  # already loading
             if then:
                 self.catalog_waiting.append(then)
             return
         self.catalog_waiting = [then] if then else []
-
-        def progress(done, total):
-            if not quiet:
-                self.call_on_ui(lambda: self.notify(
-                    f"Downloading recipes from TheMealDB\u2026 {round(100 * done / total)}%", sticky=True))
+        self.catalog_failed = False
+        if not quiet:
+            self.notify("Loading recipes from TheMealDB\u2026", sticky=True)
 
         def finished(meals, error):
             waiting, self.catalog_waiting = self.catalog_waiting, None
             if error or not meals:
+                self.catalog_failed = True
+                self.refresh_explore()
                 if not quiet:
                     self.notify("Couldn't reach TheMealDB \u2014 check your internet connection")
                 return
-            save_catalog(meals)
             self.catalog = meals
             self.catalog_by_id = {m["id"]: m for m in meals}
             self.explore_order = self.shuffled_ids()
             self.refresh_cuisine_menu()
             self.refresh_explore()
             if not quiet:
-                self.notify(f"{len(meals)} recipes ready to explore")
+                self.toast.place_forget()
             for fn in waiting:
                 fn()
 
-        if not quiet:
-            self.notify("Downloading recipes from TheMealDB\u2026", sticky=True)
-        threading.Thread(target=lambda: self._download_catalog(progress, finished), daemon=True).start()
+        self.background(fetch_index, finished)
 
-    def _download_catalog(self, progress, finished):
-        try:
-            meals, error = fetch_catalog(progress), None
-        except Exception as e:
-            meals, error = None, e
-        self.call_on_ui(lambda: finished(meals, error))
+    def reload_catalog(self):
+        self.catalog, self.catalog_by_id = [], {}
+        self.refresh_explore()
+        self.ensure_catalog()
+
+    def full_meal(self, meal):
+        """A meal with whatever we know about it: its list entry, its fetched recipe, and its own fields."""
+        return {**self.catalog_by_id.get(meal.get("id"), {}), **self.details.get(meal.get("id"), {}), **meal}
+
+    def needs_details(self, meal):
+        m = self.full_meal(meal)
+        return bool(m.get("id") and not m.get("instructions") and not m.get("parts"))
+
+    def with_details(self, meals, then):
+        """Fetch full recipes (ingredients, instructions) live for any of these meals that need it, then call `then`."""
+        ids = sorted({m["id"] for m in meals if self.needs_details(m)})
+        if not ids:
+            return then()
+
+        def done(found, error):
+            if error:
+                return self.notify("Couldn't reach TheMealDB \u2014 check your internet connection")
+            self.details.update(found)
+            self.toast.place_forget()
+            then()
+        self.run_in_background(lambda: fetch_by_ids(ids), done, "Loading recipe\u2026")
 
     def is_favorite(self, name):
         return any(f["name"].lower() == name.lower() for f in self.data["favorites"])
@@ -1512,17 +1683,8 @@ class MealPlanner(tk.Tk):
         self.refresh_week()
 
     def open_meal(self, meal):
-        """Show a recipe, first fetching full details if we only have the name and photo."""
-        if meal.get("id") in self.catalog_by_id and "instructions" not in meal:
-            meal = dict(self.catalog_by_id[meal["id"]], origin=meal.get("origin"))
-        if meal.get("id") and "instructions" not in meal:
-            def done(found, error):
-                if error or meal["id"] not in found:
-                    return self.notify("Couldn't load that recipe")
-                self.toast.place_forget()
-                self.show_details(dict(found[meal["id"]], origin=meal.get("origin")))
-            return self.run_in_background(lambda: fetch_by_ids([meal["id"]]), done, "Loading recipe…")
-        self.show_details(meal)
+        """Show a recipe, fetching its ingredients and instructions live first if needed."""
+        self.with_details([meal], lambda: self.show_details(self.full_meal(meal)))
 
     def toggle_keep(self, day):
         self.data["kept"][day] = not self.data["kept"][day]
@@ -1858,7 +2020,7 @@ class MealPlanner(tk.Tk):
     def build_explore_page(self):
         page = tk.Frame(self.pages_frame, bg=BG)
         _, actions = self.page_header(page, "Explore new ideas",
-                                      "Every recipe on TheMealDB. Click a photo for the full recipe.")
+                                      "Recipes from TheMealDB. Click a photo for the full recipe.")
         shuffle = button(actions, "\u21bb  Shuffle", self.shuffle_explore, "soft")
         shuffle.pack(side="right")
         Tooltip(shuffle, "Show the recipes in a new random order")
@@ -1938,7 +2100,21 @@ class MealPlanner(tk.Tk):
             self.search_entry.delete(0, "end")
         if self.search_job:
             self.after_cancel(self.search_job)
-        self.search_job = self.after(250, self.filters_changed)
+        self.search_job = self.after(250, self.search_changed)
+
+    def search_changed(self):
+        self.filters_changed()
+        # Also ask TheMealDB live which recipes use this ingredient ("garlic", "chicken breast").
+        term = self.search_entry.get().strip().lower()
+        if len(term) < 3 or self.ingredient_hits[0] == term:
+            return
+
+        def done(ids, error):
+            if error or self.search_entry.get().strip().lower() != term:
+                return
+            self.ingredient_hits = (term, ids)
+            self.refresh_explore()
+        self.background(lambda: search_ingredient(term), done)
 
     def shuffle_explore(self):
         self.explore_order = self.shuffled_ids()
@@ -1988,7 +2164,10 @@ class MealPlanner(tk.Tk):
             areas = {cuisine}
         else:
             areas = None
-        words = self.search_entry.get().lower().split()
+        query = self.search_entry.get().strip().lower()
+        words = query.split()
+        # Ingredient matches come live from TheMealDB (see on_search_key).
+        by_ingredient = self.ingredient_hits[1] if self.ingredient_hits[0] == query else set()
         result = []
         for mid in self.explore_order:
             m = self.catalog_by_id[mid]
@@ -1997,8 +2176,8 @@ class MealPlanner(tk.Tk):
             if t != "all" and t not in meal_types(m):
                 continue
             if words:
-                text = " ".join([m["name"], m["category"], m["area"]] + m["ingredients"]).lower()
-                if not all(w in text for w in words):
+                text = " ".join([m["name"], m["category"], m["area"]]).lower()
+                if not all(w in text for w in words) and m["id"] not in by_ingredient:
                     continue
             if self.passes_leave_out(m):
                 result.append(m)
@@ -2008,7 +2187,13 @@ class MealPlanner(tk.Tk):
         grid = self.pages["explore"].cards
         if not self.catalog:
             self.filter_count.config(text="")
-            return grid.set_cards([], "Downloading the recipe list\u2026\nThis only takes a moment the first time.")
+            if self.catalog_failed:
+                retry = tk.Frame(grid.inner, bg=BG)
+                tk.Label(retry, text="Couldn't reach TheMealDB. Check your internet connection.", bg=BG, fg=MUTED,
+                         font=(F, 12)).pack(pady=(60, 12))
+                button(retry, "Try again", self.reload_catalog).pack()
+                return grid.set_cards([retry])
+            return grid.set_cards([], "Loading recipes from TheMealDB\u2026")
         visible = self.explore_visible()
         shown = visible[:self.explore_limit]
         self.filter_count.config(text=f"Showing {len(shown)} of {len(visible)} matching recipes"
@@ -2016,11 +2201,11 @@ class MealPlanner(tk.Tk):
         cards = []
         for meal in shown:
             card, body = meal_card(grid.inner, self.images, meal, (220, 160),
-                                   on_open=lambda m=meal: self.show_details(m))
+                                   on_open=lambda m=meal: self.open_meal(m))
             row = tk.Frame(body, bg=CARD)
             row.pack(fill="x", side="bottom", pady=(8, 0))
             self.heart_button(row, meal).pack(side="left")
-            button(row, "View recipe", lambda m=meal: self.show_details(m), "ghost", small=True).pack(side="right")
+            button(row, "View recipe", lambda m=meal: self.open_meal(m), "ghost", small=True).pack(side="right")
             cards.append(card)
         if len(visible) > len(shown):
             more = tk.Frame(grid.inner, bg=BG)
@@ -2126,9 +2311,7 @@ class MealPlanner(tk.Tk):
                 meals.append((day + " side", side))
         if not meals:
             return self.notify("Plan some meals first")
-        if any(m.get("id") for _, m in meals) and not self.catalog:
-            return self.ensure_catalog(then=lambda: self.ingredients_dialog(meals))
-        self.ingredients_dialog(meals)
+        self.with_details([m for _, m in meals], lambda: self.ingredients_dialog(meals))
 
     def ingredients_dialog(self, meals):
         """Tick the ingredients you need for one or more meals, then add them to the shopping list."""
@@ -2150,12 +2333,12 @@ class MealPlanner(tk.Tk):
         checks = []
         cards = []
         for label, meal in meals:
-            full = dict(self.catalog_by_id.get(meal.get("id"), {}), **meal)
+            full = self.full_meal(meal)
             card = tk.Frame(grid.inner, bg=CARD, highlightthickness=1, highlightbackground=BORDER, padx=12, pady=10)
             title = f"{label}: {meal['name']}" if label else meal["name"]
             tk.Label(card, text=title, bg=CARD, fg=TEXT, font=(F, 11, "bold"), anchor="w", wraplength=520,
                      justify="left").pack(fill="x", pady=(0, 4))
-            parts = meal_parts(full, self.catalog_by_id)
+            parts = meal_parts(full, self.details)
             if not parts:
                 tk.Label(card, text="No ingredients saved for this meal.", bg=CARD, fg=MUTED, font=(F, 9),
                          anchor="w").pack(fill="x")
@@ -2216,7 +2399,7 @@ class MealPlanner(tk.Tk):
                 side="left", padx=8)
         if meal.get("youtube"):
             button(row, "▶ Watch video", lambda: webbrowser.open(meal["youtube"]), "ghost").pack(side="left")
-        if meal_parts(meal, self.catalog_by_id):
+        if meal_parts(meal, self.details):
             button(info, "\u2611  Add ingredients to shopping list", lambda: self.ingredients_dialog([("", meal)]),
                    "soft").pack(anchor="w", pady=(8, 0))
 
@@ -2342,8 +2525,10 @@ class MealPlanner(tk.Tk):
     def add_favorite(self, meal):
         if self.is_favorite(meal["name"]):
             return
-        meal = dict(self.catalog_by_id.get(meal.get("id"), {}), **meal)
-        fav = {k: meal[k] for k in ("id", "name", "category", "area", "thumb", "ingredients",
+        if self.needs_details(meal):  # favorites keep the full recipe
+            return self.with_details([meal], lambda: self.add_favorite(meal))
+        meal = self.full_meal(meal)
+        fav = {k: meal[k] for k in ("id", "name", "category", "area", "thumb", "ingredients", "parts",
                                     "instructions", "url", "youtube") if k in meal}
         fav.setdefault("notes", "")
         self.data["favorites"].append(fav)

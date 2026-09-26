@@ -1,7 +1,7 @@
-/* Offline support: the app itself and recipe photos are cached; GitHub and TheMealDB data calls always use the network. */
-const VERSION = "meal-planner-v4-1";
+/* Offline support: the app itself and recipe photos are cached; family sync (Supabase) and TheMealDB data calls always use the network. */
+const VERSION = "meal-planner-v6";
 const PHOTOS = "meal-planner-photos";
-const SHELL = ["./", "index.html", "style.css", "core.js", "app.js", "manifest.webmanifest",
+const SHELL = ["./", "index.html", "style.css", "config.js", "core.js", "app.js", "manifest.webmanifest",
   "icons/icon-192.png", "icons/icon-512.png", "icons/apple-touch-icon.png"];
 
 self.addEventListener("install", (e) => {

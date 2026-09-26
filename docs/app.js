@@ -4,7 +4,6 @@
   const MP = window.MP;
   const PAGE_SIZE = 100;
   const SYNC_EVERY_MS = 60000;
-  const CATALOG_MAX_AGE_DAYS = 7;
   const PASTELS = ["#F6C9A8", "#F4D58D", "#B8DDB1", "#A9D3E8", "#D5C1EC", "#F2B8C6", "#C9D7A6"];
   const isIOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
     (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
@@ -15,31 +14,16 @@
   const S = {
     data: null, snapshot: null,
     sync: {}, syncState: "off", syncDetail: "", syncing: false, syncAgain: false, syncTimer: null,
-    catalog: [], byId: {}, catalogLoading: false, catalogProgress: 0, catalogWaiting: [],
+    catalog: [], byId: {}, details: {}, catalogLoading: false, catalogFailed: false, catalogWaiting: [],
+    ingredientHits: { term: "", ids: new Set() },
     page: "week", viewingLast: false, favTab: "all", favQuery: "", exploreQuery: "",
-    exploreLimit: PAGE_SIZE, exploreOrder: [], setupBanner: false,
+    exploreLimit: PAGE_SIZE, exploreOrder: [], session: null, family: null, lastSync: 0, familyStep: null,
   };
 
   const store = {
-    get(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch (e) { return fallback; } },
-    set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { toast("Couldn't save on this phone: storage is full"); } },
+    get(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } },
+    set(key, value) { try { localStorage.setItem(key, JSON.stringify(value)); } catch { toast("Couldn't save on this phone: storage is full"); } },
   };
-
-  function idb(mode, fn) {
-    return new Promise((resolve, reject) => {
-      const open = indexedDB.open("meal-planner", 1);
-      open.onupgradeneeded = () => open.result.createObjectStore("kv");
-      open.onerror = () => reject(open.error);
-      open.onsuccess = () => {
-        const tx = open.result.transaction("kv", mode);
-        const req = fn(tx.objectStore("kv"));
-        tx.oncomplete = () => resolve(req && req.result);
-        tx.onerror = () => reject(tx.error);
-      };
-    });
-  }
-  const idbGet = (key) => idb("readonly", (s) => s.get(key)).catch(() => null);
-  const idbSet = (key, value) => idb("readwrite", (s) => s.put(value, key)).catch(() => null);
 
   function save() {
     S.snapshot = MP.stamp(S.data, S.snapshot);
@@ -62,7 +46,6 @@
     clearTimeout(toastTimer);
     if (!sticky) toastTimer = setTimeout(() => el.classList.remove("show"), 2800);
   }
-  const hideToast = () => $("#toast").classList.remove("show");
 
   function photo(meal, cls, big) {
     const name = (meal && meal.name) || "?";
@@ -74,16 +57,7 @@
     return `<img class="photo ${cls || ""}" src="${esc(url)}" alt="" loading="lazy" data-ph="${esc(ph)}" onerror="this.outerHTML=this.dataset.ph">`;
   }
 
-  // ------------------------------------------------------------ recipe catalog (all of TheMealDB, kept offline)
-
-  async function loadCatalog() {
-    const cached = await idbGet("catalog");
-    if (cached && cached.meals && cached.meals.length) {
-      setCatalog(cached.meals);
-      const age = (Date.now() - cached.date) / 86400000;
-      if (age > CATALOG_MAX_AGE_DAYS && navigator.onLine) ensureCatalog(null, true);
-    }
-  }
+  // ------------------------------------------------------------ recipes, live from TheMealDB
 
   function setCatalog(meals) {
     S.catalog = meals;
@@ -92,41 +66,50 @@
     S.exploreOrder = MP.shuffled(meals.map((m) => m.id));
   }
 
-  /** Make sure the recipe list is downloaded, then call `then`. */
+  /** Load the list of recipes (names, photos, categories) live, then call `then`. Takes a second or two. */
   function ensureCatalog(then, quiet) {
-    if (S.catalog.length && !quiet) return then && then();
+    if (S.catalog.length) return then && then();
     if (then) S.catalogWaiting.push(then);
     if (S.catalogLoading) return;
     S.catalogLoading = true;
-    S.catalogProgress = 0;
-    if (!quiet) { toast("Downloading recipes…", true); render(); }
-    MP.fetchCatalog((done, total) => {
-      S.catalogProgress = done / total;
-      if (!quiet) {
-        toast(`Downloading recipes… ${Math.round(100 * S.catalogProgress)}%`, true);
-        const bar = $("#catalog-bar");
-        if (bar) bar.style.width = Math.round(100 * S.catalogProgress) + "%";
-      }
-    }).then((meals) => {
+    S.catalogFailed = false;
+    if (!quiet) toast("Loading recipes\u2026", true);
+    if (S.page === "explore") render();
+    MP.fetchIndex().then((meals) => {
       setCatalog(meals);
-      idbSet("catalog", { date: Date.now(), meals });
-      if (!quiet) toast(`${meals.length} recipes ready`);
-      const waiting = S.catalogWaiting; S.catalogWaiting = [];
       S.catalogLoading = false;
-      render();
+      if (!quiet) $("#toast").classList.remove("show");
+      const waiting = S.catalogWaiting; S.catalogWaiting = [];
+      renderWhenIdle();
       waiting.forEach((fn) => fn());
     }).catch(() => {
       S.catalogLoading = false;
+      S.catalogFailed = true;
       S.catalogWaiting = [];
-      if (!quiet) toast("Couldn't reach TheMealDB — check your connection");
-      render();
+      if (!quiet) toast("Couldn't reach TheMealDB \u2014 check your connection");
+      renderWhenIdle();
     });
   }
 
   function fullMeal(meal) {
     if (!meal) return meal;
     const fav = meal.uid && favByUid(meal.uid);
-    return Object.assign({}, meal.id ? S.byId[meal.id] : null, fav || {}, meal);
+    return Object.assign({}, meal.id ? S.byId[meal.id] : null, meal.id ? S.details[meal.id] : null, fav || {}, meal);
+  }
+
+  /** Recipes whose ingredients and instructions haven't been fetched yet. */
+  const needsDetails = (meal) => { const m = fullMeal(meal); return !!(m && m.id && !m.instructions && !(m.parts && m.parts.length)); };
+
+  /** Fetch full recipes (ingredients, instructions) live for any of these meals that need it, then call `then`. */
+  function withDetails(meals, then) {
+    const ids = meals.filter(needsDetails).map((m) => m.id);
+    if (!ids.length) return then();
+    toast("Loading recipe\u2026", true);
+    MP.fetchDetails(ids).then((found) => {
+      Object.assign(S.details, found);
+      $("#toast").classList.remove("show");
+      then();
+    }).catch(() => toast("Couldn't reach TheMealDB \u2014 check your connection"));
   }
 
   // ------------------------------------------------------------ week logic
@@ -238,9 +221,10 @@
 
   function addFavorite(meal) {
     if (isFavorite(meal.name)) return;
+    if (needsDetails(meal)) return withDetails([meal], () => addFavorite(meal)); // favorites keep the full recipe
     const m = fullMeal(meal);
     const fav = {};
-    for (const k of ["id", "name", "category", "area", "thumb", "ingredients", "instructions", "url", "youtube"]) if (m[k]) fav[k] = m[k];
+    for (const k of ["id", "name", "category", "area", "thumb", "ingredients", "parts", "instructions", "url", "youtube"]) if (m[k]) fav[k] = m[k];
     fav.notes = "";
     S.data.favorites.push(fav);
     S.data.week.forEach((w, i) => { if (w && w.name === meal.name) S.data.week[i] = Object.assign({}, w, { origin: "Favorite" }); });
@@ -273,12 +257,8 @@
     const d = S.data;
     const lw = lastWeek();
     let html = "";
-    if (S.setupBanner) {
-      html += `<div class="banner"><b>Sync is set up in this browser.</b> ` +
-        (isIOS && !standalone ? `Now tap <b>Share → Add to Home Screen</b>. If the home-screen app then says “Sync off”, tap it, paste into <b>Setup code</b> (it's already copied) and tap <b>Connect</b>.`
-          : `Add it to your home screen from the browser menu (⋮ → Install app).`) + `</div>`;
-    } else if (!standalone && !S.sync.repo) {
-      html += `<div class="banner">Tip: add this app to your home screen — ${isIOS ? "Share → Add to Home Screen" : "⋮ → Install app"}. Tap <b>Sync off</b> at the top to connect it to the desktop app.</div>`;
+    if (!standalone && !S.family) {
+      html += `<div class="banner">Tip: add this app to your home screen — ${isIOS ? "Share → Add to Home Screen" : "⋮ → Install app"}. Tap <b>Family</b> at the top to share with your family.</div>`;
     }
     const ahead = (MP.parseIso(d.week_start) - MP.weekStartOf(new Date())) / 86400000;
     const label = S.viewingLast ? "Last week" : ahead <= 0 ? "This week" : ahead === 7 ? "Next week" : "Upcoming week";
@@ -295,7 +275,6 @@
       <div class="row"><select data-act="source" aria-label="Pick meals from">${MP.SOURCES.map(([k, l]) =>
         `<option value="${k}" ${d.source === k ? "selected" : ""}>Pick from: ${l}</option>`).join("")}</select></div>
       <p class="hint">Nothing from last week is repeated. ↻ Swap changes one day; Keep holds a day when you shuffle.</p>`;
-    if (S.catalogLoading && d.source !== "favorites") html += `<div class="progress"><div id="catalog-bar" style="width:${Math.round(100 * S.catalogProgress)}%"></div></div>`;
     const start = MP.parseIso(d.week_start), today = MP.isoDate(new Date());
     html += `<ol class="days">`;
     MP.DAYS.forEach((day, i) => {
@@ -366,12 +345,13 @@
   function renderExploreShell() {
     const f = S.data.filters;
     if (!S.catalog.length) {
-      if (!S.catalogLoading) setTimeout(() => ensureCatalog(), 0);
-      return `<div class="page-head"><div><h1>Explore</h1><p class="sub">Every recipe on TheMealDB</p></div></div>
-        <p class="empty">Downloading the recipe list…\nThis only happens the first time (about 40 seconds).</p>
-        <div class="progress"><div id="catalog-bar" style="width:${Math.round(100 * S.catalogProgress)}%"></div></div>`;
+      if (!S.catalogLoading && !S.catalogFailed) setTimeout(() => ensureCatalog(null, true), 0);
+      return `<div class="page-head"><div><h1>Explore</h1><p class="sub">Recipes from TheMealDB. Tap a photo for the full recipe.</p></div></div>
+        ${S.catalogFailed ? `<p class="empty">Couldn’t reach TheMealDB. Check your connection.</p>
+          <div class="more"><button class="btn primary" data-act="refresh-catalog">Try again</button></div>`
+          : `<p class="empty">Loading recipes from TheMealDB…</p>`}`;
     }
-    return `<div class="page-head"><div><h1>Explore</h1><p class="sub">Every recipe on TheMealDB. Tap a photo for the recipe.</p></div>
+    return `<div class="page-head"><div><h1>Explore</h1><p class="sub">Recipes from TheMealDB. Tap a photo for the full recipe.</p></div>
       <button class="btn small soft" data-act="explore-shuffle">↻ Shuffle</button></div>
       <input type="search" id="explore-search" placeholder="Search dishes or ingredients, e.g. chicken" value="${esc(S.exploreQuery)}" autocomplete="off">
       <div class="chips" style="margin-top:10px">${MP.MEAL_TYPES.map(([k, l]) =>
@@ -389,6 +369,8 @@
     if (f.cuisine.startsWith("region:")) areas = new Set(MP.REGIONS[f.cuisine.slice(7)] || []);
     else if (f.cuisine !== MP.ALL_CUISINES) areas = new Set([f.cuisine]);
     const words = S.exploreQuery.toLowerCase().split(/\s+/).filter(Boolean);
+    // Ingredient matches come live from TheMealDB (see the search box handler).
+    const byIngredient = S.ingredientHits.term === S.exploreQuery.trim().toLowerCase() ? S.ingredientHits.ids : new Set();
     const out = [];
     for (const id of S.exploreOrder) {
       const m = S.byId[id];
@@ -396,8 +378,8 @@
       if (areas && !areas.has(m.area)) continue;
       if (f.type !== "all" && !MP.mealTypes(m).has(f.type)) continue;
       if (words.length) {
-        const text = [m.name, m.category, m.area].concat(m.ingredients).join(" ").toLowerCase();
-        if (!words.every((w) => text.includes(w))) continue;
+        const text = [m.name, m.category, m.area].join(" ").toLowerCase();
+        if (!words.every((w) => text.includes(w)) && !byIngredient.has(m.id)) continue;
       }
       if (passesLeaveOut(m)) out.push(m);
     }
@@ -490,7 +472,7 @@
 
   /** A checklist of ingredients; each checkbox carries its name, amount and meal. */
   function ingredientChecklist(meal) {
-    const parts = MP.mealParts(fullMeal(meal), S.byId);
+    const parts = MP.mealParts(fullMeal(meal), S.details);
     if (!parts.length) return `<p class="muted small">No ingredients saved for this meal.</p>`;
     return `<ul class="ing-list">${parts.map((p) => {
       const skip = ["water", "cold water", "hot water", "boiling water", "warm water", "ice"].includes(p.n.trim().toLowerCase());
@@ -529,8 +511,8 @@
       meals.map(([label, m]) => `<div class="meal-group">${esc(label)}: ${esc(m.name)}</div>${ingredientChecklist(m)}`).join("") +
       `<div class="sticky-actions"><button class="btn primary block" data-act="add-ingredients">Add to shopping list</button></div>`,
       (sheet) => { updateAddButton(sheet); sheet.addEventListener("change", () => updateAddButton(sheet)); });
-    // Explore meals need the recipe list for their ingredients.
-    if (meals.some(([, m]) => m.id) && !S.catalog.length) ensureCatalog(go); else go();
+    // Explore meals' ingredients are fetched live.
+    withDetails(meals.map(([, m]) => m), go);
   }
 
   // ------------------------------------------------------------ bottom sheets
@@ -556,6 +538,7 @@
   const sheetHead = (title) => `<div class="sheet-head"><h2>${title}</h2><button class="close" data-act="close-sheet" aria-label="Close">✕</button></div>`;
 
   function showDetails(meal) {
+    if (needsDetails(meal)) return withDetails([meal], () => showDetails(meal));
     const m = fullMeal(meal);
     const sub = [m.category, m.area].filter(Boolean).join(" · ");
     let html = (m.thumb ? `<img class="hero" src="${esc(MP.thumbUrl(m.thumb, true))}" alt="">` : "") + sheetHead(esc(m.name)) +
@@ -563,13 +546,13 @@
       `<div class="actions">${heartButton(m, "save-detail")}` +
       (m.url ? `<a class="btn" href="${esc(m.url)}" target="_blank" rel="noopener">Full recipe ↗</a>` : "") +
       (m.youtube ? `<a class="btn" href="${esc(m.youtube)}" target="_blank" rel="noopener">▶ Video</a>` : "") + `</div>`;
-    if (MP.mealParts(m, S.byId).length) {
+    if (MP.mealParts(m, S.details).length) {
       html += `<h3>Ingredients</h3>${ingredientChecklist(m)}
         <button class="btn soft block" data-act="add-ingredients" style="margin-top:10px">Add to shopping list</button>`;
     }
     if (m.instructions) html += `<h3>Instructions</h3><div class="instructions">${esc(m.instructions.replace(/\r\n/g, "\n"))}</div>`;
     if (m.notes) html += `<h3>My notes</h3><div class="instructions">${esc(m.notes)}</div>`;
-    if (!MP.mealParts(m, S.byId).length && !m.instructions && !m.notes) html += `<p class="muted">No recipe details saved for this meal. Add a recipe link or notes from Favorites.</p>`;
+    if (!MP.mealParts(m, S.details).length && !m.instructions && !m.notes) html += `<p class="muted">No recipe details saved for this meal. Add a recipe link or notes from Favorites.</p>`;
     S.detailMeal = m;
     openSheet(html, (sheet) => { updateAddButton(sheet); sheet.addEventListener("change", () => updateAddButton(sheet)); });
   }
@@ -642,53 +625,126 @@
         <button class="btn" data-act="share-copy">Copy</button></div>`);
   }
 
-  function settingsSheet() {
-    const cfg = S.sync;
-    const status = S.syncState === "ok" ? `Connected to ${esc(cfg.repo)} — last synced ${cfg.lastSync ? new Date(cfg.lastSync).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "just now"}`
-      : S.syncState === "error" ? esc(S.syncDetail) : S.syncState === "syncing" ? "Syncing…" : "Not connected.";
-    openSheet(sheetHead("Sync with the desktop app") + `
-      <p class="sub">Your favorites, weekly plans and filters sync through a private GitHub repo that only you can see.</p>
-      <p class="status ${S.syncState}" id="sync-status">${status}</p>
-      ${cfg.repo ? `<div class="actions"><button class="btn primary" data-act="sync-now">Sync now</button>
-        <button class="btn" data-act="copy-setup">Copy setup code</button><button class="btn" data-act="sync-off">Turn off</button></div>` : ""}
-      <h3>Connect</h3>
-      <ol class="steps"><li>In the desktop app, click <b>Sync</b> at the top and follow the steps.</li>
-        <li>Scan the QR code it shows with your phone's camera — or copy the setup code and paste it here.</li></ol>
-      <form class="form" id="setup-form"><label class="field">Setup code<input type="text" name="code" placeholder="Paste setup code" autocomplete="off"></label>
-        <button class="btn primary" type="submit">Connect</button></form>
-      <details style="margin-top:14px"><summary class="muted">Enter repo and token instead</summary>
-        <form class="form" id="manual-form"><label class="field">Repo<input type="text" name="repo" placeholder="yourname/meal-planner-data" value="${esc(cfg.repo || "")}"></label>
-          <label class="field">Token<input type="password" name="token" autocomplete="off"></label>
-          <button class="btn" type="submit">Connect</button></form></details>
-      <h3>Recipes</h3><p class="sub">${S.catalog.length} recipes saved on this phone for offline use.</p>
-      <div class="actions"><button class="btn" data-act="refresh-catalog">Refresh recipe list</button></div>`, (sheet) => {
-      $("#setup-form", sheet).addEventListener("submit", (e) => {
-        e.preventDefault();
-        try { connect(MP.decodeSetup(new FormData(e.target).get("code"))); }
-        catch (err) { setStatus("That setup code doesn't look right. Copy it again from the desktop app.", "error"); }
-      });
-      $("#manual-form", sheet).addEventListener("submit", (e) => {
-        e.preventDefault();
-        const f = new FormData(e.target);
-        const repo = f.get("repo").trim(), token = f.get("token").trim() || S.sync.token || "";
-        if (!repo.includes("/") || !token) return setStatus("Enter the repo (yourname/meal-planner-data) and token.", "error");
-        connect({ repo, token });
-      });
-    });
+  // ------------------------------------------------------------ family
+
+  const CFG = window.MEAL_PLANNER_CONFIG || {};
+  const sb = new MP.Supabase(CFG.supabaseUrl, CFG.supabaseAnonKey);
+  const account = new MP.FamilyAccount(sb, {
+    get: () => S.session,
+    set: (session) => { S.session = session; store.set("mp.session", session); },
+  });
+  const familyReady = () => !!(S.session && S.family);
+
+  function setFamily(family) {
+    S.family = family;
+    if (family) store.set("mp.family", family); else localStorage.removeItem("mp.family");
   }
 
-  function setStatus(text, cls) {
-    const el = $("#sync-status");
-    if (el) { el.textContent = text; el.className = "status " + (cls || ""); }
+  /** The Family sheet: sign in -> join or start a family -> members and invites. */
+  function familySheet(error) {
+    const err = error ? `<p class="status error">${esc(error)}</p>` : "";
+    let body;
+    if (!sb.configured) {
+      body = `<p class="sub">Family sharing isn\u2019t set up in this copy of the app yet. Everything else works and is saved in this browser.</p>`;
+    } else if (!S.session) {
+      const email = S.familyStep && S.familyStep.email;
+      body = !email
+        ? `<p class="sub">No password needed \u2014 we\u2019ll email you a 6-digit code.</p>
+           <form class="form" id="email-form"><label class="field">Email<input type="email" name="email" required autocomplete="email" placeholder="you@example.com"></label>
+           <button class="btn primary" type="submit">Email me a code</button></form>${err}`
+        : `<p class="sub">We sent a code to <b>${esc(email)}</b>.</p>
+           <form class="form" id="code-form"><label class="field">Code<input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" required></label>
+           <button class="btn primary" type="submit">Sign in</button></form>${err}
+           <div class="actions"><button class="btn" data-act="fam-resend">Send a new code</button><button class="btn" data-act="fam-other-email">Different email</button></div>`;
+    } else if (!S.family) {
+      body = `<p class="sub">Signed in as ${esc(S.session.email)}. Everyone in a family shares the same week, favorites and shopping list.</p>
+        <h3>Join with an invite code</h3>
+        <form class="form" id="join-form"><label class="field">Invite code<input type="text" name="code" required placeholder="ABCD-2345" autocapitalize="characters"></label>
+          <label class="field">Your name<input type="text" name="name" placeholder="e.g. Sam"></label>
+          <button class="btn primary" type="submit">Join family</button>
+          <p class="note">The family\u2019s week plan replaces this one. Your favorites and list items are added to the family\u2019s.</p></form>
+        <h3>Or start a family</h3>
+        <form class="form" id="create-form"><label class="field">Family name<input type="text" name="family" required placeholder="e.g. The Smiths"></label>
+          <label class="field">Your name<input type="text" name="name" placeholder="e.g. Sam"></label>
+          <button class="btn" type="submit">Start family</button></form>${err}
+        <div class="actions"><button class="btn" data-act="fam-signout">Sign out</button></div>`;
+    } else {
+      const f = S.family, owner = f.role === "owner";
+      const when = S.lastSync ? new Date(S.lastSync).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+      const status = S.syncState === "error" ? `<p class="status error">${esc(S.syncDetail)}</p>`
+        : `<p class="status ok">${S.syncState === "syncing" ? "Syncing\u2026" : "Synced" + (when ? " at " + when : "")}</p>`;
+      body = `<p class="sub">${esc(f.name)}</p>${status}
+        <h3>Members</h3><ul class="items">${f.members.map((m) => `<li class="item"><div class="item-text"><div class="item-name">${esc(m.display_name || "(no name)")}${m.me ? ' <span class="item-qty">(you)</span>' : ""}</div>
+          ${m.role === "owner" ? '<div class="item-for">Owner</div>' : ""}</div>
+          ${owner && !m.me ? `<button class="x" data-act="fam-remove" data-uid="${esc(m.user_id)}" aria-label="Remove ${esc(m.display_name)}">\u2715</button>` : ""}</li>`).join("")}</ul>
+        <div class="actions"><button class="btn primary" data-act="fam-invite">Invite someone</button><button class="btn" data-act="sync-now">Sync now</button></div>
+        <div id="invite-box"></div>${err}
+        <div class="actions"><button class="btn" data-act="fam-leave">Leave family</button><button class="btn" data-act="fam-signout">Sign out</button></div>`;
+    }
+    openSheet(sheetHead("Family") + body + `<h3>Recipes</h3><p class="sub">${S.catalog.length ? S.catalog.length + " recipes from TheMealDB, loaded live." : "Recipes load live from TheMealDB."}</p>
+      <div class="actions"><button class="btn" data-act="refresh-catalog">Reload recipes</button></div>`, (sheet) => wireFamilyForms(sheet));
+  }
+
+  /** Run an action from the Family sheet, then redraw it (with the error message if it failed). */
+  async function familyAction(fn) {
+    try { await fn(); familySheet(); render(); } catch (e) { familySheet(e.message || "Something went wrong."); }
+  }
+
+  function wireFamilyForms(sheet) {
+    const on = (id, fn) => { const f = $("#" + id, sheet); if (f) f.addEventListener("submit", (e) => { e.preventDefault(); fn(new FormData(e.target)); }); };
+    on("email-form", (f) => familyAction(async () => { const email = f.get("email").trim(); await sb.sendCode(email); S.familyStep = { email }; }));
+    on("code-form", (f) => familyAction(async () => {
+      S.session = await sb.verifyCode(S.familyStep.email, f.get("code"));
+      store.set("mp.session", S.session);
+      S.familyStep = null;
+      const families = await account.myFamilies();
+      if (families.length) await enterFamily(families[0], true);
+    }));
+    on("join-form", (f) => familyAction(async () => { await enterFamily(await account.joinFamily(f.get("code"), f.get("name")), true); toast(`Joined \u201c${S.family.name}\u201d`); }));
+    on("create-form", (f) => familyAction(async () => { await enterFamily(await account.createFamily(f.get("family"), f.get("name")), false); toast("Family created \u2014 now invite someone"); }));
+  }
+
+  /** After creating or joining: a phone that joins takes the family's week plan and settings. */
+  async function enterFamily(family, joining) {
+    if (joining) { S.data.plan_updated = 0; S.data.settings_updated = 0; }
+    setFamily(family);
+    await syncNow();
+    rollOverWeek();
+  }
+
+  async function refreshFamily() {
+    if (!familyReady()) return;
+    try {
+      const mine = (await account.myFamilies()).find((f) => f.family_id === S.family.family_id);
+      if (mine) setFamily(mine); else { setFamily(null); toast("You\u2019re no longer in that family. Your meals are still here."); }
+    } catch (e) {
+      if (e.signedOut) signOut();
+    }
+  }
+
+  function signOut() {
+    S.session = null;
+    localStorage.removeItem("mp.session");
+    setFamily(null);
+    setSyncState("off");
+  }
+
+  async function showInvite() {
+    const inv = await account.createInvite(S.family.family_id);
+    const code = MP.formatInviteCode(inv.code);
+    const text = `Join our family on Meal Planner! Open the app, go to Family and enter this invite code: ${code} (works for 7 days).`;
+    const box = $("#invite-box");
+    if (box) box.innerHTML = `<div class="banner" style="text-align:center"><div class="small muted">INVITE CODE</div>
+      <div style="font-size:28px;font-weight:800;letter-spacing:3px">${esc(code)}</div><div class="small muted">Works for 7 days</div></div>`;
+    if (navigator.share) navigator.share({ text }).catch(() => {});
+    else if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => toast("Invite copied \u2014 paste it in a message"));
   }
 
   // ------------------------------------------------------------ sync
 
-  const syncReady = () => !!(S.sync.repo && S.sync.token);
-
   function renderSyncChip() {
     const chip = $("#sync-chip");
-    const labels = { off: "⇅ Sync off", syncing: "⇅ Syncing…", ok: "✓ Synced", error: "⚠ Sync problem" };
+    const labels = { off: "\u21c5 Family", syncing: "\u21c5 Syncing\u2026", ok: "\u2713 Synced", error: "\u26a0 Sync problem" };
     chip.textContent = labels[S.syncState];
     chip.className = "sync-chip " + S.syncState;
   }
@@ -697,29 +753,22 @@
     S.syncState = state;
     S.syncDetail = detail || "";
     renderSyncChip();
-    if ($("#sync-status")) settingsSheetRefresh();
-  }
-  function settingsSheetRefresh() {
-    const cls = S.syncState;
-    const text = cls === "ok" ? `Connected to ${S.sync.repo} — last synced ${new Date(S.sync.lastSync || Date.now()).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
-      : cls === "error" ? S.syncDetail : cls === "syncing" ? "Syncing…" : "Not connected.";
-    setStatus(text, cls);
   }
 
   function scheduleSync(delay) {
-    if (!syncReady()) return;
+    if (!familyReady()) return;
     clearTimeout(S.syncTimer);
     S.syncTimer = setTimeout(syncNow, delay ?? 2000);
   }
 
   async function syncNow() {
-    if (!syncReady()) return;
+    if (!familyReady()) return;
     if (S.syncing) { S.syncAgain = true; return; }
     S.syncing = true;
     setSyncState("syncing");
-    const gh = new MP.GitHubStore(S.sync.repo, S.sync.token, S.sync.api);  // api: only set by tests
+    const fs = new MP.FamilyStore(account, S.family.family_id);
     try {
-      const { data: remote, sha } = await gh.pull();
+      const { data: remote, sha } = await fs.pull();
       const merged = MP.mergeData(S.data, remote);
       if (MP.canonical(merged) !== MP.canonical(S.data)) {
         S.data = MP.normalizeData(merged);
@@ -728,45 +777,18 @@
         renderWhenIdle();
       }
       if (!(remote && MP.canonical(merged) === MP.canonical(remote))) {
-        try { await gh.push(merged, sha); }
-        catch (e) { if (e.conflict) S.syncAgain = true; else throw e; }
+        try { await fs.push(merged, sha); } catch (e) { if (e.conflict) S.syncAgain = true; else throw e; }
       }
-      S.sync.lastSync = Date.now();
-      store.set("mp.sync", S.sync);
+      S.lastSync = Date.now();
+      store.set("mp.lastSync", S.lastSync);
       setSyncState("ok");
     } catch (e) {
       setSyncState("error", e.message || "Sync failed");
+      if (e.signedOut) signOut();
+      else if (/not in this family/.test(e.message || "")) { setFamily(null); setSyncState("off"); toast("You\u2019re no longer in that family. Your meals are still here."); }
     } finally {
       S.syncing = false;
       if (S.syncAgain) { S.syncAgain = false; scheduleSync(500); }
-    }
-  }
-
-  async function connect(cfg) {
-    setStatus("Checking…");
-    try {
-      await new MP.GitHubStore(cfg.repo, cfg.token, S.sync.api).check();
-    } catch (e) {
-      return setStatus(e.message, "error");
-    }
-    S.sync = { repo: cfg.repo, token: cfg.token, api: S.sync.api };
-    store.set("mp.sync", S.sync);
-    await syncNow();
-    if (S.syncState === "ok") toast("Connected — your meals are synced");
-  }
-
-  function readSetupFromUrl() {
-    const m = location.hash.match(/#setup=([A-Za-z0-9_-]+)/);
-    if (!m) return;
-    history.replaceState(null, "", location.pathname + location.search);
-    try {
-      const cfg = MP.decodeSetup(m[1]);
-      S.sync = { repo: cfg.repo, token: cfg.token };
-      store.set("mp.sync", S.sync);
-      S.setupBanner = true;
-      if (navigator.clipboard) navigator.clipboard.writeText(m[1]).catch(() => {});
-    } catch (e) {
-      toast("That setup link didn't work — try scanning it again");
     }
   }
 
@@ -779,7 +801,7 @@
     const d = S.data;
     switch (act) {
       case "page": S.page = el.dataset.page; closeSheet(); render(); window.scrollTo(0, 0); break;
-      case "settings": settingsSheet(); break;
+      case "settings": S.familyStep = null; familySheet(); refreshFamily().then(() => { if ($("#invite-box") || $("#join-form")) familySheet(); }); break;
       case "close-sheet": closeSheet(); break;
       case "close-sheet-bg": if (e.target === el) closeSheet(); break;
       case "view": S.viewingLast = el.dataset.last === "1"; render(); break;
@@ -853,14 +875,18 @@
       }
       case "remove-item": d.shopping = d.shopping.filter((x) => x.uid !== el.dataset.uid); save(); render(); break;
       case "clear-checked": d.shopping = d.shopping.filter((x) => !x.checked); save(); render(); break;
-      case "sync-now": syncNow(); break;
-      case "copy-setup": navigator.clipboard.writeText(MP.encodeSetup(S.sync)).then(() => toast("Setup code copied — keep it private")); break;
-      case "sync-off":
-        if (confirm("Stop syncing on this phone? Your meals stay on this phone and in GitHub.")) {
-          S.sync = {}; store.set("mp.sync", {}); setSyncState("off"); closeSheet();
-        }
+      case "sync-now": syncNow().then(() => familySheet()); break;
+      case "fam-resend": familyAction(() => sb.sendCode(S.familyStep.email)); break;
+      case "fam-other-email": S.familyStep = null; familySheet(); break;
+      case "fam-signout": signOut(); familySheet(); render(); break;
+      case "fam-invite": showInvite().catch((e2) => familySheet(e2.message)); break;
+      case "fam-remove":
+        if (confirm("Remove this person from the family?")) familyAction(async () => setFamily(await account.removeMember(S.family.family_id, el.dataset.uid)));
         break;
-      case "refresh-catalog": closeSheet(); S.catalog = []; ensureCatalog(); break;
+      case "fam-leave":
+        if (confirm("Leave this family? Your meals stay here.")) familyAction(async () => { await account.leaveFamily(S.family.family_id); setFamily(null); setSyncState("off"); });
+        break;
+      case "refresh-catalog": closeSheet(); S.catalog = []; S.catalogFailed = false; ensureCatalog(); break;
     }
   });
 
@@ -875,7 +901,21 @@
   document.addEventListener("input", (e) => {
     if (e.target.id === "explore-search") {
       clearTimeout(searchTimer);
-      searchTimer = setTimeout(() => { S.exploreQuery = e.target.value; S.exploreLimit = PAGE_SIZE; renderExploreResults(); }, 200);
+      searchTimer = setTimeout(() => {
+        const query = e.target.value;
+        S.exploreQuery = query;
+        S.exploreLimit = PAGE_SIZE;
+        renderExploreResults();
+        // Also ask TheMealDB live which recipes use this ingredient ("garlic", "chicken breast"...).
+        const term = query.trim().toLowerCase();
+        if (term.length >= 3 && S.ingredientHits.term !== term) {
+          MP.searchIngredient(term).then((ids) => {
+            if (S.exploreQuery.trim().toLowerCase() !== term) return;
+            S.ingredientHits = { term, ids };
+            renderExploreResults();
+          }).catch(() => {});
+        }
+      }, 250);
     } else if (e.target.id === "fav-search") {
       S.favQuery = e.target.value;
       renderFavResults();
@@ -912,12 +952,13 @@
     S.snapshot = MP.clone(S.data);
     S.snapshot = MP.stamp(S.data, S.snapshot);
     store.set("mp.data", S.data);
-    S.sync = store.get("mp.sync", {});
-    readSetupFromUrl();
+    S.session = store.get("mp.session", null);
+    S.family = store.get("mp.family", null);
+    S.lastSync = store.get("mp.lastSync", 0);
+    localStorage.removeItem("mp.sync"); // old GitHub sync settings
     render();
-    await loadCatalog();
-    render();
-    if (syncReady()) await syncNow();
+    ensureCatalog(null, true); // recipe names and photos, live
+    if (familyReady()) await syncNow();
     rollOverWeek();
     if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
   }
