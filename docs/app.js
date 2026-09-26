@@ -275,7 +275,7 @@
     let html = "";
     if (S.setupBanner) {
       html += `<div class="banner"><b>Sync is set up in this browser.</b> ` +
-        (isIOS && !standalone ? `Now tap <b>Share → Add to Home Screen</b>. If the home-screen app then says “Sync off”, open its sync settings and tap <b>Paste setup code</b> (it's already copied).`
+        (isIOS && !standalone ? `Now tap <b>Share → Add to Home Screen</b>. If the home-screen app then says “Sync off”, tap it, paste into <b>Setup code</b> (it's already copied) and tap <b>Connect</b>.`
           : `Add it to your home screen from the browser menu (⋮ → Install app).`) + `</div>`;
     } else if (!standalone && !S.sync.repo) {
       html += `<div class="banner">Tip: add this app to your home screen — ${isIOS ? "Share → Add to Home Screen" : "⋮ → Install app"}. Tap <b>Sync off</b> at the top to connect it to the desktop app.</div>`;
