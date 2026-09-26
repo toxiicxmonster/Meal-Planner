@@ -576,18 +576,18 @@
 
   function pickerSheet(day, side) {
     if (!S.data.favorites.length) return toast("Add some Favorites first");
+    const favs = S.data.favorites.filter((m) => !side || MP.mealTypes(m).has("sides"))
+      .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+    if (!favs.length) return toast("None of your favorites are tagged Side yet — tap a meal's Side tag on Favorites");
     const what = side ? "side" : "meal";
     const slot = side ? S.data.sides : S.data.week;
     const current = (slot[day] && slot[day].name.toLowerCase()) || "";
     const lw = lastWeekNames();
-    const favs = S.data.favorites.slice().sort((a, b) =>
-      (side ? (MP.mealTypes(a).has("sides") ? 0 : 1) - (MP.mealTypes(b).has("sides") ? 0 : 1) : 0) ||
-      a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
     const cards = favs.map((m) => `<div class="card pick ${m.name.toLowerCase() === current ? "on" : ""} clickable" data-act="pick" data-uid="${m.uid}" data-day="${day}" data-side="${side ? 1 : 0}" data-name="${esc(m.name.toLowerCase())}">
       ${photo(m)}<div class="card-body"><div class="card-name">${esc(m.name)}${m.name.toLowerCase() === current ? " ✓" : ""}</div>
       ${lw.has(m.name.toLowerCase()) ? `<div class="card-sub"><i>Had it last week</i></div>` : ""}</div></div>`).join("");
     openSheet(sheetHead(`Choose a ${what} for ${MP.DAYS[day]}`) +
-      `<p class="sub">${side ? "Favorites tagged Side are listed first." : "It will be marked Keep so shuffling won't replace it."}</p>
+      `<p class="sub">${side ? "Only favorites tagged Side are shown." : "It will be marked Keep so shuffling won't replace it."}</p>
       <input type="search" id="picker-search" placeholder="Filter favorites…" style="margin:10px 0">
       <div class="grid" id="picker-grid">${cards}</div>`, (sheet) => {
       $("#picker-search", sheet).addEventListener("input", (e) => {

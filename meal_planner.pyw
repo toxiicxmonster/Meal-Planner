@@ -1680,6 +1680,10 @@ class MealPlanner(tk.Tk):
         """Let the user hand-pick a favorite as the meal (or side) for one day of the week."""
         if not self.data["favorites"]:
             return messagebox.showinfo("No favorites yet", "Add some meals on the Favorites page first.")
+        if side and not any("sides" in meal_types(m) for m in self.data["favorites"]):
+            return messagebox.showinfo("No sides yet", "None of your favorites are tagged Side yet.\n\n"
+                                       "On the Favorites page, click a meal's Side tag (or tick Side when "
+                                       "adding a meal) and it will show up here.")
         what = "side" if side else "meal"
         slot = self.data["sides"] if side else self.data["week"]
         win = tk.Toplevel(self, bg=BG)
@@ -1694,8 +1698,7 @@ class MealPlanner(tk.Tk):
                  font=(F, 15, "bold")).pack(side="left")
         search = PlaceholderEntry(head, "Filter favorites…", width=24)
         search.pack(side="right", ipady=5)
-        hint = ("Click a favorite to serve it as this day's side. Favorites with the category Side are "
-                "listed first." if side else
+        hint = ("Click a side to serve it this day. Only favorites tagged Side are shown." if side else
                 "Click a meal to put it on this day. It will be marked Keep so shuffling won't replace it.")
         tk.Label(win, text=hint,
                  bg=BG, fg=MUTED, font=(F, 9), padx=20, anchor="w").pack(fill="x", pady=(0, 8))
@@ -1715,8 +1718,8 @@ class MealPlanner(tk.Tk):
 
         def fill():
             query = search.get().lower().strip()
-            favs = sorted(self.data["favorites"],
-                          key=lambda m: (side and "sides" not in meal_types(m), m["name"].lower()))
+            favs = sorted((m for m in self.data["favorites"] if not side or "sides" in meal_types(m)),
+                          key=lambda m: m["name"].lower())
             cards = []
             for meal in favs:
                 if query and query not in f"{meal['name']} {meal.get('category', '')}".lower():
