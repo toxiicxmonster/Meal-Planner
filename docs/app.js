@@ -891,7 +891,7 @@
   document.addEventListener("submit", (e) => {
     if (e.target.id !== "add-item") return;
     e.preventDefault();
-    const input = e.target.elements.item;
+    const input = e.target.querySelector("input");  // not .elements.item: every form has a built-in item() function
     const { name, qty } = MP.parseQuickItem(input.value);
     if (!name) return;
     MP.addToList(S.data.shopping, [{ name, qty }]);
