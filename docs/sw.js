@@ -1,5 +1,5 @@
 /* Offline support: the app itself and recipe photos are cached; GitHub and TheMealDB data calls always use the network. */
-const VERSION = "meal-planner-v3";
+const VERSION = "meal-planner-v4";
 const PHOTOS = "meal-planner-photos";
 const SHELL = ["./", "index.html", "style.css", "core.js", "app.js", "manifest.webmanifest",
   "icons/icon-192.png", "icons/icon-512.png", "icons/apple-touch-icon.png"];

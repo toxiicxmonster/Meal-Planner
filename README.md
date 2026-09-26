@@ -109,8 +109,8 @@ The first time you open **Explore** on the phone, it downloads the recipe list (
 - **Swap** a day you don't like, or **Choose** a specific favorite for it. **Keep** holds a day when you shuffle again.
 
 **Sides.**
-- **+ Random side** picks a side dish for the day, and **Pick** chooses one from your Favorites.
-- Favorites tagged **Side** are used first.
+- **+ Random side** picks a side dish for the day. Favorites tagged **Side** are used first.
+- **Pick** lets you choose from your favorites tagged **Side**. Tag a meal as a side on the Favorites page.
 
 **Shopping.**
 - Tap **Shopping** on This Week to add the whole week's ingredients, or open any recipe and add its ingredients from there. Untick anything you already have.
