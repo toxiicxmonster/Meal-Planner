@@ -1,0 +1,7 @@
+# Personal data: favorites, weekly plans, history, filters
+meal_data.json
+
+# Caches the app rebuilds on its own
+image_cache/
+recipe_catalog.json
+__pycache__/
