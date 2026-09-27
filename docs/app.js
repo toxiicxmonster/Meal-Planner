@@ -17,7 +17,7 @@
     catalog: [], byId: {}, details: {}, catalogLoading: false, catalogFailed: false, catalogWaiting: [],
     ingredientHits: { term: "", ids: new Set() },
     page: "week", viewingLast: false, favTab: "all", favQuery: "", exploreQuery: "",
-    exploreLimit: PAGE_SIZE, exploreOrder: [], session: null, family: null, lastSync: 0, familyStep: null,
+    exploreLimit: PAGE_SIZE, exploreOrder: [], pendingInvite: null, session: null, family: null, lastSync: 0, inviteText: "",
   };
 
   const store = {
@@ -410,7 +410,8 @@
     const favs = S.data.favorites;
     const count = (k) => favs.filter((m) => k === "all" || MP.mealTypes(m).has(k)).length;
     return `<div class="page-head"><div><h1>Favorites${favs.length ? ` (${favs.length})` : ""}</h1>
-      <p class="sub">Tap the category tags to sort a meal — it can be in more than one.</p></div></div>
+      <p class="sub">Tap the category tags to sort a meal — it can be in more than one.</p></div>
+      <button class="btn small soft" data-act="import-recipe">⤓ Import from a website</button></div>
       <div class="chips">${MP.FAV_TABS.map(([k, l]) => `<button class="chip ${S.favTab === k ? "on" : ""}" data-act="fav-tab" data-key="${k}">${l} ${count(k)}</button>`).join("")}</div>
       <input type="search" id="fav-search" placeholder="Filter favorites…" value="${esc(S.favQuery)}" autocomplete="off">
       <div id="fav-results" style="margin-top:12px"></div>
@@ -580,36 +581,137 @@
     });
   }
 
-  function editorSheet(uid) {
+  /** Add or edit a favorite. `draft` pre-fills a new one (an imported recipe). */
+  function editorSheet(uid, draft) {
     const existing = uid ? favByUid(uid) : null;
-    const start = existing ? MP.mealTypes(existing) : new Set([S.favTab !== "all" ? S.favTab : "dinner"]);
-    openSheet(sheetHead(existing ? "Edit meal" : "Add a meal") + `<form class="form" id="fav-form">
-      <label class="field">Meal name<input type="text" name="name" required value="${esc(existing ? existing.name : "")}"></label>
+    const base = existing || draft || {};
+    const start = existing ? MP.mealTypes(existing) : new Set(draft && draft.types ? draft.types : [S.favTab !== "all" ? S.favTab : "dinner"]);
+    const title = existing ? "Edit meal" : draft ? "Check the recipe" : "Add a meal";
+    openSheet(sheetHead(title) + (draft ? `<p class="sub">Imported from ${esc(draft.notes && draft.notes.split("from ").pop() || "the website")}. Fix anything that looks off, then save.</p>` : "") +
+      `<form class="form" id="fav-form">
+      <label class="field">Meal name<input type="text" name="name" required value="${esc(base.name || "")}"></label>
       <div class="field"><b>Categories</b> <span class="note">tick all that apply</span>
         <div class="checks">${MP.TYPE_TAGS.map(([k, l]) => `<label class="check"><input type="checkbox" name="type" value="${k}" ${start.has(k) ? "checked" : ""}> ${l}</label>`).join("")}</div></div>
-      <label class="field">Recipe link <span class="note">optional</span><input type="url" name="url" value="${esc(existing ? existing.url || "" : "")}" placeholder="https://"></label>
-      <label class="field">Photo link <span class="note">optional — paste an image address</span><input type="url" name="thumb" value="${esc(existing ? existing.thumb || "" : "")}" placeholder="https://"></label>
-      <label class="field">Notes<textarea name="notes" rows="3">${esc(existing ? existing.notes || "" : "")}</textarea></label>
+      <label class="field">Ingredients <span class="note">one per line, e.g. \u201c2 cloves garlic\u201d</span>
+        <textarea name="ingredients" rows="8">${esc(MP.ingredientLines(base).join("\n"))}</textarea></label>
+      <label class="field">Recipe steps <span class="note">optional</span>
+        <textarea name="instructions" rows="6">${esc(base.instructions || "")}</textarea></label>
+      <label class="field">Recipe link <span class="note">optional</span><input type="url" name="url" value="${esc(base.url || "")}" placeholder="https://"></label>
+      <div class="field"><b>Photo</b> <span class="note">optional</span>
+        <div class="photo-pick"><img id="photo-preview" alt="" hidden>
+          <div class="photo-btns"><label class="btn small">\ud83d\udcf7 <span id="photo-pick-text">Add a photo</span><input type="file" id="photo-file" accept="image/*" hidden></label>
+            <button type="button" class="btn small" id="photo-remove" hidden>Remove</button></div></div>
+        <p class="status" id="photo-status" hidden></p>
+        <details class="photo-link"><summary>or paste a photo link</summary><input type="url" id="photo-url" placeholder="https://"></details></div>
+      <label class="field">Notes<textarea name="notes" rows="2">${esc(base.notes || "")}</textarea></label>
       <div class="actions">${existing ? `<button type="button" class="btn" data-act="delete-fav" data-uid="${existing.uid}">Remove</button>` : ""}
-        <button type="submit" class="btn primary">Save meal</button></div></form>`, (sheet) => {
+        <button type="submit" class="btn primary">${draft ? "Save to Favorites" : "Save meal"}</button></div></form>`, (sheet) => {
+      let photo = base.thumb || "", uploading = false;
+      const preview = $("#photo-preview", sheet), status = $("#photo-status", sheet), link = $("#photo-url", sheet);
+      const showPhoto = () => {
+        preview.hidden = !photo;
+        if (photo) preview.src = MP.thumbUrl(photo, true);
+        $("#photo-remove", sheet).hidden = !photo;
+        $("#photo-pick-text", sheet).textContent = photo ? "Change photo" : "Add a photo";
+        link.value = /^https?:/.test(photo) ? photo : "";
+      };
+      const photoStatus = (text, error) => { status.hidden = !text; status.textContent = text || ""; status.className = "status" + (error ? " error" : ""); };
+      showPhoto();
+      $("#photo-remove", sheet).addEventListener("click", () => { photo = ""; showPhoto(); photoStatus(""); });
+      link.addEventListener("change", () => { photo = link.value.trim(); showPhoto(); });
+      $("#photo-file", sheet).addEventListener("change", async (e) => {
+        const file = e.target.files[0];
+        e.target.value = "";
+        if (!file) return;
+        uploading = true;
+        photoStatus(familyReady() ? "Saving photo\u2026" : "Adding photo\u2026");
+        try {
+          photo = await savePhoto(file);
+          showPhoto();
+          photoStatus("");
+        } catch (err) {
+          photoStatus(err.message || "Couldn\u2019t use that photo.", true);
+        } finally {
+          uploading = false;
+        }
+      });
       $("#fav-form", sheet).addEventListener("submit", (e) => {
         e.preventDefault();
+        if (uploading) return toast("Wait a moment \u2014 the photo is still saving");
         const form = new FormData(e.target);
         const name = form.get("name").trim();
         if (!name) return;
         if (S.data.favorites.some((f) => f.name.toLowerCase() === name.toLowerCase() && (!existing || f.uid !== existing.uid))) {
-          return toast(`“${name}” is already in Favorites`);
+          return toast(`\u201c${name}\u201d is already in Favorites`);
         }
         const types = form.getAll("type");
         if (!types.length) return toast("Tick at least one category");
-        const meal = Object.assign({}, existing || {}, { name, types, url: form.get("url").trim(),
-          thumb: form.get("thumb").trim(), notes: form.get("notes").trim() });
+        const fields = Object.assign({}, base, { name, types, url: form.get("url").trim(), thumb: photo,
+          notes: form.get("notes").trim() });
+        delete fields.origin;
+        const meal = MP.applyRecipeEdits(fields, form.get("ingredients"), form.get("instructions"));
         const i = existing ? S.data.favorites.findIndex((f) => f.uid === existing.uid) : -1;
         if (i >= 0) S.data.favorites[i] = meal; else S.data.favorites.push(meal);
         save();
         closeSheet();
         render();
-        toast(`♥ Saved “${name}”`);
+        toast(`\u2665 Saved \u201c${name}\u201d`);
+      });
+    });
+  }
+
+  /** Shrink a photo from this device; in a family it's saved online for everyone, otherwise kept in the meal. */
+  async function savePhoto(file) {
+    const url = URL.createObjectURL(file);
+    let img;
+    try {
+      img = await new Promise((resolve, reject) => {
+        const el = new Image();
+        el.onload = () => resolve(el);
+        el.onerror = () => reject(new Error("That file isn\u2019t a photo this browser can open."));
+        el.src = url;
+      });
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+    const online = familyReady();
+    const size = MP.photoSize(img.naturalWidth, img.naturalHeight, online ? MP.PHOTO_MAX : MP.PHOTO_LOCAL_MAX);
+    const canvas = Object.assign(document.createElement("canvas"), size);
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff"; // transparent PNGs get a white background, not black
+    ctx.fillRect(0, 0, size.width, size.height);
+    ctx.drawImage(img, 0, 0, size.width, size.height);
+    if (!online) return canvas.toDataURL("image/jpeg", MP.PHOTO_QUALITY);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", MP.PHOTO_QUALITY));
+    return account.uploadPhoto(S.family.family_id, blob);
+  }
+
+  /** Import a recipe from a website: paste a link, then check it in the editor. */
+  function importSheet(error, link, failedUrl) {
+    const err = error ? `<p class="status error">${esc(error)}</p>` : "";
+    const manual = failedUrl ? `<div class="actions"><button class="btn" data-act="import-manual" data-url="${esc(failedUrl)}">Add it by hand instead</button></div>` : "";
+    const needsSignIn = !S.session;
+    openSheet(sheetHead("Import a recipe") + `
+      <p class="sub">Paste a link to a recipe page. The app reads the recipe (ingredients, steps, photo) and lets you check it before saving.</p>
+      ${needsSignIn ? `<p class="status error">On the web app, importing needs you to be in a family \u2014 tap <b>Family</b> at the top first. (The iPhone and desktop apps can import without it.)</p>` : ""}
+      <form class="form" id="import-form"><label class="field">Recipe link<input type="url" name="url" required placeholder="https://www.example.com/recipe/\u2026" value="${esc(link || "")}" autocomplete="off"></label>
+        <button class="btn primary" type="submit" ${needsSignIn ? "disabled" : ""}>Get recipe</button></form>${err}${manual}`, (sheet) => {
+      $("#import-form", sheet).addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const raw = new FormData(e.target).get("url");
+        const url = MP.normalizeUrl(raw);
+        if (!url) return importSheet("That doesn\u2019t look like a web address.", raw);
+        const btn = e.target.querySelector("button");
+        btn.disabled = true;
+        btn.textContent = "Getting recipe\u2026";
+        try {
+          const page = await account.fetchPage(url);
+          const recipe = MP.extractRecipe(page.html, page.url || url);
+          if (!recipe) return importSheet("That page doesn\u2019t include recipe details the app can read.", url, url);
+          editorSheet(null, recipe);
+        } catch (err2) {
+          importSheet(err2.message || "Couldn\u2019t get that recipe.", url, url);
+        }
       });
     });
   }
@@ -640,46 +742,32 @@
     if (family) store.set("mp.family", family); else localStorage.removeItem("mp.family");
   }
 
-  /** The Family sheet: sign in -> join or start a family -> members and invites. */
+  /** The Family sheet: join with an invite (QR code or code) -> members and invites. No emails anywhere. */
   function familySheet(error) {
     const err = error ? `<p class="status error">${esc(error)}</p>` : "";
     let body;
     if (!sb.configured) {
       body = `<p class="sub">Family sharing isn\u2019t set up in this copy of the app yet. Everything else works and is saved in this browser.</p>`;
-    } else if (!S.session) {
-      const email = S.familyStep && S.familyStep.email;
-      body = !email
-        ? `<p class="sub">No password needed \u2014 we\u2019ll email you a 6-digit code.</p>
-           <form class="form" id="email-form"><label class="field">Email<input type="email" name="email" required autocomplete="email" placeholder="you@example.com"></label>
-           <button class="btn primary" type="submit">Email me a code</button></form>${err}`
-        : `<p class="sub">We sent a code to <b>${esc(email)}</b>.</p>
-           <form class="form" id="code-form"><label class="field">Code<input type="text" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="8" required></label>
-           <button class="btn primary" type="submit">Sign in</button></form>${err}
-           <div class="actions"><button class="btn" data-act="fam-resend">Send a new code</button><button class="btn" data-act="fam-other-email">Different email</button></div>`;
     } else if (!S.family) {
-      body = `<p class="sub">Signed in as ${esc(S.session.email)}. Everyone in a family shares the same week, favorites and shopping list.</p>
-        <h3>Join with an invite code</h3>
-        <form class="form" id="join-form"><label class="field">Invite code<input type="text" name="code" required placeholder="ABCD-2345" autocapitalize="characters"></label>
-          <label class="field">Your name<input type="text" name="name" placeholder="e.g. Sam"></label>
+      body = `<p class="sub">${S.pendingInvite ? "You’ve been invited to join a family." : "Families are set up on the Meal Planner desktop app."}
+          Everyone in a family shares the same week, favorites and shopping list. No email or password needed.</p>
+        <form class="form" id="invite-join-form"><label class="field">Invite code<input type="text" name="code" required placeholder="ABCD-2345" autocapitalize="characters" value="${esc(S.pendingInvite ? MP.formatInviteCode(S.pendingInvite) : "")}"></label>
+          <label class="field">Family member name<input type="text" name="name" required placeholder="e.g. Sam" autocomplete="given-name"></label>
           <button class="btn primary" type="submit">Join family</button>
-          <p class="note">The family\u2019s week plan replaces this one. Your favorites and list items are added to the family\u2019s.</p></form>
-        <h3>Or start a family</h3>
-        <form class="form" id="create-form"><label class="field">Family name<input type="text" name="family" required placeholder="e.g. The Smiths"></label>
-          <label class="field">Your name<input type="text" name="name" placeholder="e.g. Sam"></label>
-          <button class="btn" type="submit">Start family</button></form>${err}
-        <div class="actions"><button class="btn" data-act="fam-signout">Sign out</button></div>`;
+          <p class="note">Scan the QR code on the family computer (or on the primary household member’s phone) to fill in the code. The family’s week plan replaces this one; your favorites and list items are added to the family’s.</p></form>${err}`;
     } else {
-      const f = S.family, owner = f.role === "owner";
+      const f = S.family, manager = MP.canManage(f);
       const when = S.lastSync ? new Date(S.lastSync).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
       const status = S.syncState === "error" ? `<p class="status error">${esc(S.syncDetail)}</p>`
         : `<p class="status ok">${S.syncState === "syncing" ? "Syncing\u2026" : "Synced" + (when ? " at " + when : "")}</p>`;
       body = `<p class="sub">${esc(f.name)}</p>${status}
         <h3>Members</h3><ul class="items">${f.members.map((m) => `<li class="item"><div class="item-text"><div class="item-name">${esc(m.display_name || "(no name)")}${m.me ? ' <span class="item-qty">(you)</span>' : ""}</div>
-          ${m.role === "owner" ? '<div class="item-for">Owner</div>' : ""}</div>
-          ${owner && !m.me ? `<button class="x" data-act="fam-remove" data-uid="${esc(m.user_id)}" aria-label="Remove ${esc(m.display_name)}">\u2715</button>` : ""}</li>`).join("")}</ul>
-        <div class="actions"><button class="btn primary" data-act="fam-invite">Invite someone</button><button class="btn" data-act="sync-now">Sync now</button></div>
+          ${MP.ROLE_LABELS[m.role] ? `<div class="item-for">${MP.ROLE_LABELS[m.role]}</div>` : ""}</div>
+          ${manager && !m.me && m.role !== "owner" ? `<button class="x" data-act="fam-remove" data-uid="${esc(m.user_id)}" aria-label="Remove ${esc(m.display_name)}">\u2715</button>` : ""}</li>`).join("")}</ul>
+        ${f.role === "primary" ? '<p class="note">You’re the primary household member: you can invite people and remove them.</p>' : ""}
+        <div class="actions">${manager ? '<button class="btn primary" data-act="fam-invite">Invite someone</button>' : ""}<button class="btn" data-act="sync-now">Sync now</button></div>
         <div id="invite-box"></div>${err}
-        <div class="actions"><button class="btn" data-act="fam-leave">Leave family</button><button class="btn" data-act="fam-signout">Sign out</button></div>`;
+        <div class="actions"><button class="btn" data-act="fam-leave">Leave family</button></div>`;
     }
     openSheet(sheetHead("Family") + body + `<h3>Recipes</h3><p class="sub">${S.catalog.length ? S.catalog.length + " recipes from TheMealDB, loaded live." : "Recipes load live from TheMealDB."}</p>
       <div class="actions"><button class="btn" data-act="refresh-catalog">Reload recipes</button></div>`, (sheet) => wireFamilyForms(sheet));
@@ -692,16 +780,18 @@
 
   function wireFamilyForms(sheet) {
     const on = (id, fn) => { const f = $("#" + id, sheet); if (f) f.addEventListener("submit", (e) => { e.preventDefault(); fn(new FormData(e.target)); }); };
-    on("email-form", (f) => familyAction(async () => { const email = f.get("email").trim(); await sb.sendCode(email); S.familyStep = { email }; }));
-    on("code-form", (f) => familyAction(async () => {
-      S.session = await sb.verifyCode(S.familyStep.email, f.get("code"));
-      store.set("mp.session", S.session);
-      S.familyStep = null;
-      const families = await account.myFamilies();
-      if (families.length) await enterFamily(families[0], true);
-    }));
-    on("join-form", (f) => familyAction(async () => { await enterFamily(await account.joinFamily(f.get("code"), f.get("name")), true); toast(`Joined \u201c${S.family.name}\u201d`); }));
-    on("create-form", (f) => familyAction(async () => { await enterFamily(await account.createFamily(f.get("family"), f.get("name")), false); toast("Family created \u2014 now invite someone"); }));
+    on("invite-join-form", (f) => familyAction(() => joinWithInvite(f.get("code"), f.get("name"))));
+  }
+
+  /** Join a family with an invite code and a family member name. The device signs itself in (no email). */
+  async function joinWithInvite(code, name) {
+    name = String(name || "").trim();
+    if (!name) throw new Error("Enter a family member name.");
+    await account.ensureSignedIn();
+    await enterFamily(await account.joinFamily(code, name), true);
+    S.pendingInvite = null;
+    localStorage.removeItem("mp.pendingInvite");
+    toast(`Joined “${S.family.name}”`);
   }
 
   /** After creating or joining: a phone that joins takes the family's week plan and settings. */
@@ -722,6 +812,7 @@
     }
   }
 
+  /** The device's sign-in stopped working (its account is gone): forget it so it can join again. */
   function signOut() {
     S.session = null;
     localStorage.removeItem("mp.session");
@@ -729,15 +820,20 @@
     setSyncState("off");
   }
 
+  /** Show an invite: a QR code to scan with another phone, the code, and a message to send. */
   async function showInvite() {
     const inv = await account.createInvite(S.family.family_id);
     const code = MP.formatInviteCode(inv.code);
-    const text = `Join our family on Meal Planner! Open the app, go to Family and enter this invite code: ${code} (works for 7 days).`;
+    const link = location.origin + location.pathname + "#join=" + inv.code;
+    S.inviteText = `Join our family on Meal Planner! Tap this link on your phone: ${link}\n\nOr open the app, go to Family and enter the invite code ${code}. It works for 7 days.`;
+    const qr = window.qrcode ? MP.qrSvgPath(window.qrcode, link) : null;
     const box = $("#invite-box");
-    if (box) box.innerHTML = `<div class="banner" style="text-align:center"><div class="small muted">INVITE CODE</div>
-      <div style="font-size:28px;font-weight:800;letter-spacing:3px">${esc(code)}</div><div class="small muted">Works for 7 days</div></div>`;
-    if (navigator.share) navigator.share({ text }).catch(() => {});
-    else if (navigator.clipboard) navigator.clipboard.writeText(text).then(() => toast("Invite copied \u2014 paste it in a message"));
+    if (box) box.innerHTML = `<div class="banner invite" style="text-align:center">
+      ${qr ? `<div class="small muted">SCAN WITH A PHONE\u2019S CAMERA TO JOIN</div>
+        <svg class="qr" viewBox="0 0 ${qr.size} ${qr.size}" role="img" aria-label="Invite QR code"><rect width="100%" height="100%" fill="#fff"/><path d="${qr.path}" fill="#000"/></svg>` : ""}
+      <div class="small muted">INVITE CODE</div>
+      <div style="font-size:28px;font-weight:800;letter-spacing:3px">${esc(code)}</div><div class="small muted">Works for 7 days, for as many family members as you like.</div>
+      <div class="actions"><button class="btn" data-act="fam-send-invite">${navigator.share ? "Send invite\u2026" : "Copy invite message"}</button></div></div>`;
   }
 
   // ------------------------------------------------------------ sync
@@ -801,7 +897,7 @@
     const d = S.data;
     switch (act) {
       case "page": S.page = el.dataset.page; closeSheet(); render(); window.scrollTo(0, 0); break;
-      case "settings": S.familyStep = null; familySheet(); refreshFamily().then(() => { if ($("#invite-box") || $("#join-form")) familySheet(); }); break;
+      case "settings": familySheet(); refreshFamily().then(() => { if ($("#invite-box") || $("#join-form")) familySheet(); }); break;
       case "close-sheet": closeSheet(); break;
       case "close-sheet-bg": if (e.target === el) closeSheet(); break;
       case "view": S.viewingLast = el.dataset.last === "1"; render(); break;
@@ -858,6 +954,8 @@
       case "open-fav": showDetails(favByUid(el.dataset.uid)); break;
       case "edit-fav": editorSheet(el.dataset.uid); break;
       case "add-fav": editorSheet(null); break;
+      case "import-recipe": importSheet(); break;
+      case "import-manual": editorSheet(null, { url: el.dataset.url, types: [S.favTab !== "all" ? S.favTab : "dinner"] }); break;
       case "delete-fav": {
         const fav = favByUid(el.dataset.uid);
         if (fav && confirm(`Remove “${fav.name}” from Favorites?`)) {
@@ -876,9 +974,10 @@
       case "remove-item": d.shopping = d.shopping.filter((x) => x.uid !== el.dataset.uid); save(); render(); break;
       case "clear-checked": d.shopping = d.shopping.filter((x) => !x.checked); save(); render(); break;
       case "sync-now": syncNow().then(() => familySheet()); break;
-      case "fam-resend": familyAction(() => sb.sendCode(S.familyStep.email)); break;
-      case "fam-other-email": S.familyStep = null; familySheet(); break;
-      case "fam-signout": signOut(); familySheet(); render(); break;
+      case "fam-send-invite":
+        if (navigator.share) navigator.share({ text: S.inviteText }).catch(() => {});
+        else if (navigator.clipboard) navigator.clipboard.writeText(S.inviteText).then(() => toast("Invite copied \u2014 paste it in a message"));
+        break;
       case "fam-invite": showInvite().catch((e2) => familySheet(e2.message)); break;
       case "fam-remove":
         if (confirm("Remove this person from the family?")) familyAction(async () => setFamily(await account.removeMember(S.family.family_id, el.dataset.uid)));
@@ -956,7 +1055,15 @@
     S.family = store.get("mp.family", null);
     S.lastSync = store.get("mp.lastSync", 0);
     localStorage.removeItem("mp.sync"); // old GitHub sync settings
+    S.pendingInvite = store.get("mp.pendingInvite", null);
+    const invite = location.hash.match(/#join=([A-Za-z0-9-]+)/);
+    if (invite) {
+      history.replaceState(null, "", location.pathname + location.search);
+      S.pendingInvite = invite[1].replace(/-/g, "");
+      store.set("mp.pendingInvite", S.pendingInvite);
+    }
     render();
+    if (S.pendingInvite && !familyReady()) familySheet();
     ensureCatalog(null, true); // recipe names and photos, live
     if (familyReady()) await syncNow();
     rollOverWeek();

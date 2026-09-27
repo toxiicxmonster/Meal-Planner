@@ -2,6 +2,7 @@
 import React, { useMemo, useState } from "react";
 import { ActivityIndicator, Linking, Platform, Pressable, Share, Text, TextInput, View } from "react-native";
 import * as Clipboard from "expo-clipboard";
+import * as ImagePicker from "expo-image-picker";
 import { Ionicons } from "@expo/vector-icons";
 import { usePlanner, MP } from "../lib/planner";
 import { Button, C, Empty, MealPhoto, Sheet, s, tap } from "./ui";
@@ -182,29 +183,41 @@ export function PickerSheet({ target, onClose }) {
 // ---------------------------------------------------------------- add / edit a favorite
 
 export function EditorSheet({ target, onClose }) {
-  // target: undefined = closed, {uid: null} = new meal, {uid} = edit
+  // target: undefined = closed, {uid: null} = new meal, {uid} = edit, {uid: null, draft} = imported recipe to check
+  const P = usePlanner();
+  if (!target) return <Sheet visible={false} onClose={onClose} title="" />;
+  const existing = target.uid ? P.favByUid(target.uid) : null;
+  // Favorites saved before recipes were kept: fetch the recipe so its ingredients can be edited.
+  if (existing && P.needsDetails(existing)) return <LoadingSheet meals={[existing]} title="Edit meal" onClose={onClose} />;
+  const title = existing ? "Edit meal" : target.draft ? "Check the recipe" : "Add a meal";
   return (
-    <Sheet visible={!!target} onClose={onClose} title={target && target.uid ? "Edit meal" : "Add a meal"}>
-      {target ? <EditorForm key={target.uid || "new"} uid={target.uid} startType={target.type} onClose={onClose} /> : null}
+    <Sheet visible onClose={onClose} title={title}>
+      <EditorForm key={target.uid || "new"} uid={target.uid} draft={target.draft} startType={target.type} onClose={onClose} />
     </Sheet>
   );
 }
 
-function EditorForm({ uid, startType, onClose }) {
+function EditorForm({ uid, draft, startType, onClose }) {
   const P = usePlanner();
   const existing = uid ? P.favByUid(uid) : null;
-  const [name, setName] = useState(existing ? existing.name : "");
-  const [types, setTypes] = useState(() => [...(existing ? MP.mealTypes(existing) : new Set([startType || "dinner"]))]);
-  const [url, setUrl] = useState(existing ? existing.url || "" : "");
-  const [thumb, setThumb] = useState(existing ? existing.thumb || "" : "");
-  const [notes, setNotes] = useState(existing ? existing.notes || "" : "");
+  const base = existing ? P.fullMeal(existing) : draft || {};
+  const [name, setName] = useState(base.name || "");
+  const [types, setTypes] = useState(() => [...(existing ? MP.mealTypes(existing) : new Set(draft && draft.types ? draft.types : [startType || "dinner"]))]);
+  const [ingredients, setIngredients] = useState(() => MP.ingredientLines(base).join("\n"));
+  const [instructions, setInstructions] = useState(base.instructions || "");
+  const [url, setUrl] = useState(base.url || "");
+  const [thumb, setThumb] = useState(base.thumb || "");
+  const [notes, setNotes] = useState(base.notes || "");
   const [error, setError] = useState(null);
+  const [photoBusy, setPhotoBusy] = useState(false);
   const toggle = (k) => setTypes((t) => (t.includes(k) ? t.filter((x) => x !== k) : t.concat(k)));
+  const hint = (text) => <Text style={[s.muted, { fontWeight: "400" }]}>{text}</Text>;
   return (
     <View>
+      {draft ? <Text style={[s.muted, { marginBottom: 4 }]}>Fix anything that looks off, then save it to Favorites.</Text> : null}
       <Text style={s.label}>Meal name</Text>
-      <TextInput style={s.input} value={name} onChangeText={setName} placeholder="e.g. Tacos" placeholderTextColor={C.muted} autoFocus={!existing} />
-      <Text style={s.label}>Categories <Text style={[s.muted, { fontWeight: "400" }]}>(tick all that apply)</Text></Text>
+      <TextInput style={s.input} value={name} onChangeText={setName} placeholder="e.g. Tacos" placeholderTextColor={C.muted} autoFocus={!existing && !draft} />
+      <Text style={s.label}>Categories {hint("(tick all that apply)")}</Text>
       <View style={s.wrap}>
         {MP.TYPE_TAGS.map(([k, l]) => (
           <Pressable key={k} onPress={() => { tap(); toggle(k); }} style={[s.chip, types.includes(k) && { backgroundColor: C.accentSoft, borderColor: C.accentSoft }]}>
@@ -212,21 +225,137 @@ function EditorForm({ uid, startType, onClose }) {
           </Pressable>
         ))}
       </View>
-      <Text style={s.label}>Recipe link <Text style={[s.muted, { fontWeight: "400" }]}>(optional)</Text></Text>
+      <Text style={s.label}>Ingredients {hint("(one per line, e.g. “2 cloves garlic”)")}</Text>
+      <TextInput style={[s.input, { minHeight: 160, textAlignVertical: "top" }]} value={ingredients} onChangeText={setIngredients}
+        multiline placeholder={"2 cloves garlic\n1 lb ground beef"} placeholderTextColor={C.muted} autoCapitalize="none" />
+      <Text style={s.label}>Recipe steps {hint("(optional)")}</Text>
+      <TextInput style={[s.input, { minHeight: 140, textAlignVertical: "top" }]} value={instructions} onChangeText={setInstructions} multiline />
+      <Text style={s.label}>Recipe link {hint("(optional)")}</Text>
       <TextInput style={s.input} value={url} onChangeText={setUrl} placeholder="https://" placeholderTextColor={C.muted} autoCapitalize="none" keyboardType="url" />
-      <Text style={s.label}>Photo link <Text style={[s.muted, { fontWeight: "400" }]}>(optional)</Text></Text>
-      <TextInput style={s.input} value={thumb} onChangeText={setThumb} placeholder="Paste an image address" placeholderTextColor={C.muted} autoCapitalize="none" keyboardType="url" />
+      <Text style={s.label}>Photo {hint("(optional)")}</Text>
+      <PhotoPicker name={name} thumb={thumb} onChange={setThumb} onBusy={setPhotoBusy} />
       <Text style={s.label}>Notes</Text>
-      <TextInput style={[s.input, { minHeight: 90, textAlignVertical: "top" }]} value={notes} onChangeText={setNotes} multiline />
+      <TextInput style={[s.input, { minHeight: 70, textAlignVertical: "top" }]} value={notes} onChangeText={setNotes} multiline />
       {error ? <Text style={{ color: C.accentDark, marginTop: 12, fontWeight: "600" }}>{error}</Text> : null}
       <View style={[s.row, { marginTop: 18 }]}>
         {existing ? <Button title="Remove" icon="trash-outline" kind="danger" onPress={() => { P.removeFavorite(uid); onClose(); }} /> : null}
-        <Button title="Save meal" kind="primary" flex onPress={() => {
-          const err = P.saveFavorite({ name, types, url, thumb, notes }, uid);
+        <Button title={photoBusy ? "Saving photo…" : draft ? "Save to Favorites" : "Save meal"} kind="primary" flex disabled={photoBusy} onPress={() => {
+          const err = P.saveFavorite({ name, types, url, thumb, notes, ingredients, instructions }, uid, existing ? P.fullMeal(existing) : draft);
           if (err) setError(err); else onClose();
         }} />
       </View>
     </View>
+  );
+}
+
+/** The meal's photo, with Take photo / Choose photo from this phone (or paste a link). */
+function PhotoPicker({ name, thumb, onChange, onBusy }) {
+  const P = usePlanner();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const [linkOpen, setLinkOpen] = useState(false);
+  const pick = async (camera) => {
+    setError(null);
+    try {
+      if (camera) {
+        const perm = await ImagePicker.requestCameraPermissionsAsync();
+        if (!perm.granted) {
+          setError("Camera access is off for Meal Planner. You can turn it on in the Settings app.");
+          return;
+        }
+      }
+      const options = { mediaTypes: ["images"], allowsEditing: true, aspect: [4, 3], quality: 1 };
+      const result = camera ? await ImagePicker.launchCameraAsync(options) : await ImagePicker.launchImageLibraryAsync(options);
+      if (result.canceled || !result.assets || !result.assets.length) return;
+      setBusy(true);
+      onBusy(true);
+      onChange(await P.savePhoto(result.assets[0]));
+    } catch (e) {
+      setError(e.message || "Couldn’t use that photo.");
+    } finally {
+      setBusy(false);
+      onBusy(false);
+    }
+  };
+  return (
+    <View style={{ gap: 8 }}>
+      <View style={{ flexDirection: "row", gap: 12, alignItems: "center" }}>
+        <View style={{ width: 120, height: 90, borderRadius: 12, overflow: "hidden", alignItems: "center", justifyContent: "center" }}>
+          <MealPhoto key={thumb} meal={{ name: name || "?", thumb }} style={{ width: 120, height: 90 }} />
+          {busy ? <View style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(255,255,255,0.6)", alignItems: "center", justifyContent: "center" }}>
+            <ActivityIndicator color={C.accent} /></View> : null}
+        </View>
+        <View style={{ flex: 1, gap: 6 }}>
+          <Button small title="Take photo" icon="camera-outline" kind="soft" disabled={busy} onPress={() => pick(true)} />
+          <Button small title="Choose photo" icon="images-outline" kind="soft" disabled={busy} onPress={() => pick(false)} />
+          {thumb ? <Button small title="Remove photo" icon="close-outline" disabled={busy} onPress={() => { setError(null); onChange(""); }} /> : null}
+        </View>
+      </View>
+      {error ? <Text style={{ color: C.accentDark, fontWeight: "600" }}>{error}</Text> : null}
+      {linkOpen ? (
+        <TextInput style={s.input} value={/^https?:/.test(thumb) ? thumb : ""} onChangeText={onChange} placeholder="Paste an image address"
+          placeholderTextColor={C.muted} autoCapitalize="none" keyboardType="url" autoFocus />
+      ) : (
+        <Pressable onPress={() => setLinkOpen(true)}><Text style={[s.muted, s.small]}>or paste a photo link</Text></Pressable>
+      )}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------- import a recipe from a website
+
+/** Paste a recipe link; on success `onImported(draft)` opens it in the editor to check. */
+export function ImportSheet({ visible, initialUrl, onClose, onImported }) {
+  if (!visible) return <Sheet visible={false} onClose={onClose} title="" />;
+  return <ImportForm key={initialUrl || "import"} initialUrl={initialUrl} onClose={onClose} onImported={onImported} />;
+}
+
+function ImportForm({ initialUrl, onClose, onImported }) {
+  const P = usePlanner();
+  const [link, setLink] = useState(initialUrl || "");
+  const [busy, setBusy] = useState(!!initialUrl); // a shared link starts importing right away
+  const [error, setError] = useState(null);
+  const [manualUrl, setManualUrl] = useState(null);
+  const failed = (e) => {
+    setError(e.message || "Couldn’t get that recipe.");
+    setManualUrl(MP.normalizeUrl(link) || null);
+    setBusy(false);
+  };
+  const get = async () => {
+    setBusy(true);
+    setError(null);
+    setManualUrl(null);
+    try {
+      const draft = await P.importRecipe(link);
+      setBusy(false);
+      onImported(draft);
+    } catch (e) {
+      failed(e);
+    }
+  };
+  React.useEffect(() => {
+    if (!initialUrl) return undefined;
+    let alive = true;
+    P.importRecipe(initialUrl).then((draft) => { if (alive) onImported(draft); }).catch((e) => { if (alive) failed(e); });
+    return () => { alive = false; };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  return (
+    <Sheet visible onClose={onClose} title="Import a recipe">
+      <Text style={s.muted}>Paste a link to a recipe page. The app reads the ingredients, steps and photo, and you can check everything before saving.</Text>
+      <TextInput style={[s.input, { marginTop: 14 }]} value={link} onChangeText={setLink} placeholder="https://www.example.com/recipe/…"
+        placeholderTextColor={C.muted} autoCapitalize="none" autoCorrect={false} keyboardType="url" returnKeyType="go" onSubmitEditing={get} />
+      <View style={[s.row, { marginTop: 10 }]}>
+        <Button small title="Paste" icon="clipboard-outline" onPress={async () => setLink(await Clipboard.getStringAsync())} />
+        <Button flex title={busy ? "Getting recipe…" : "Get recipe"} kind="primary" disabled={busy || !link.trim()} onPress={get} />
+      </View>
+      {busy ? <ActivityIndicator style={{ marginTop: 16 }} color={C.accent} /> : null}
+      {error ? <Text style={{ color: C.accentDark, marginTop: 14, fontWeight: "600" }}>{error}</Text> : null}
+      {manualUrl ? <Button title="Add it by hand instead" icon="create-outline" style={{ marginTop: 12 }}
+        onPress={() => onImported({ url: manualUrl, types: ["dinner"] }, true)} /> : null}
+      <Text style={[s.muted, s.small, { marginTop: 22 }]}>
+        Tip: to import straight from Safari, make an iPhone Shortcut that opens “mealplanner://import?url=” followed by the page link, and add it to the Share menu.
+      </Text>
+    </Sheet>
   );
 }
 

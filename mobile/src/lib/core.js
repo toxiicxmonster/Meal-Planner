@@ -256,6 +256,186 @@
     return m ? { qty: m[1].trim(), name: m[2].trim() } : { qty: "", name: text.trim() };
   }
 
+  // ------------------------------------------------------------ importing recipes from websites
+  // Recipe sites publish a machine-readable copy of each recipe for search engines (schema.org Recipe in
+  // JSON-LD). We read that. Must match extract_recipe() etc. in meal_planner.pyw.
+
+  const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", ndash: "\u2013", mdash: "\u2014",
+    lsquo: "\u2018", rsquo: "\u2019", ldquo: "\u201c", rdquo: "\u201d", hellip: "\u2026", deg: "\u00b0",
+    frac12: "\u00bd", frac14: "\u00bc", frac34: "\u00be", frac13: "\u2153", frac23: "\u2154", eacute: "\u00e9",
+    egrave: "\u00e8", ecirc: "\u00ea", agrave: "\u00e0", ccedil: "\u00e7", ntilde: "\u00f1", uuml: "\u00fc",
+    ouml: "\u00f6", auml: "\u00e4", times: "\u00d7", reg: "\u00ae", copy: "\u00a9", trade: "\u2122" };
+
+  /** Text from a recipe page: entities decoded, tags removed, spaces tidied. */
+  function cleanText(value) {
+    let t = String(value == null ? "" : value);
+    for (let i = 0; i < 2; i++) { // some sites double-encode (&amp;amp;)
+      t = t.replace(/&(#x[0-9a-f]+|#[0-9]+|[a-z]+[0-9]*);/gi, (m, e) => {
+        if (e[0] === "#") {
+          const code = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+          return code > 0 && code < 0x110000 ? String.fromCodePoint(code) : m;
+        }
+        const k = e.toLowerCase();
+        return k in ENTITIES ? ENTITIES[k] : m;
+      });
+    }
+    return t.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  }
+
+  const UNITS = "fluid ounces?|fl\\.? ?oz|tablespoons?|teaspoons?|kilograms?|milliliters?|millilitres?|ounces?|pounds?|" +
+    "grams?|liters?|litres?|quarts?|pints?|cups?|tbsps?|tbs|tsps?|lbs?|oz|kg|ml|qts?|pts?|g|l|cans?|jars?|packages?|" +
+    "pkgs?|packets?|bottles?|boxes?|bags?|cloves?|heads?|bunch(?:es)?|sprigs?|stalks?|sticks?|slices?|pieces?|" +
+    "pinch(?:es)?|dash(?:es)?|handfuls?|large|medium|small";
+  const NUM = "[0-9\u00bc-\u00be\u2150-\u215e]+(?:[.,/][0-9]+)?(?:\\s+[0-9\u00bc-\u00be\u2150-\u215e]+(?:/[0-9]+)?)?";
+  const AMOUNT_RE = new RegExp("^((?:" + NUM + ")(?:\\s*(?:-|\u2013|to)\\s*(?:" + NUM + "))?(?:\\s*\\([^)]*\\))?" +
+    "(?:\\s*(?:" + UNITS + ")(?![A-Za-z0-9_])\\.?)?(?:\\s*\\([^)]*\\))?)\\s*(.+)$", "i");
+
+  /** "2 (14 oz) cans diced tomatoes, drained" -> {q: "2 (14 oz) cans", n: "diced tomatoes"}. */
+  function parseIngredientLine(line) {
+    const text = cleanText(line).replace(/^[\u2022\u25a2\u25a1\u2610\-*\u00b7]+\s*/, "");
+    const m = text.match(AMOUNT_RE);
+    const q = m ? m[1].trim() : "";
+    let n = (m ? m[2] : text).replace(/\([^)]*\)/g, " ").split(",")[0].replace(/^of\s+/i, "").replace(/\s+/g, " ").trim();
+    if (!n) n = text;
+    return { q, n };
+  }
+
+  /** "PT1H30M" -> "1 hr 30 min". */
+  function formatDuration(iso) {
+    const m = String(iso || "").match(/^P(?:([0-9]+)D)?(?:T(?:([0-9]+)H)?(?:([0-9]+)M)?(?:[0-9.]+S)?)?$/i);
+    if (!m) return "";
+    const total = Number(m[1] || 0) * 1440 + Number(m[2] || 0) * 60 + Number(m[3] || 0);
+    const h = Math.floor(total / 60), min = total % 60;
+    return [h ? h + " hr" : "", min ? min + " min" : ""].filter(Boolean).join(" ");
+  }
+
+  function asList(v) { return v == null ? [] : Array.isArray(v) ? v : [v]; }
+
+  function isRecipeType(t) { return asList(t).some((x) => /(^|[:/])recipe$/i.test(String(x))); }
+
+  function findRecipe(node, depth) {
+    if (!node || typeof node !== "object" || depth > 6) return null;
+    if (Array.isArray(node)) {
+      for (const x of node) { const r = findRecipe(x, depth + 1); if (r) return r; }
+      return null;
+    }
+    if (isRecipeType(node["@type"])) return node;
+    for (const key of ["@graph", "mainEntity", "mainEntityOfPage", "itemListElement"]) {
+      const r = findRecipe(node[key], depth + 1);
+      if (r) return r;
+    }
+    return null;
+  }
+
+  function imageUrl(img, base) {
+    let u = "";
+    for (const x of asList(img)) {
+      u = typeof x === "string" ? x : x && typeof x === "object" ? (x.url || x.contentUrl || "") : "";
+      if (u) break;
+    }
+    if (!u) return "";
+    try { return new URL(cleanText(u), base).href; } catch { return ""; }
+  }
+
+  function instructionLines(node, out, depth) {
+    if (depth > 5 || node == null) return out;
+    if (typeof node === "string") {
+      for (const part of node.split(/\r?\n|<br\s*\/?>|<\/p>|<\/li>/i)) { const t = cleanText(part); if (t) out.push(t); }
+    } else if (Array.isArray(node)) {
+      for (const x of node) instructionLines(x, out, depth + 1);
+    } else if (typeof node === "object") {
+      if (asList(node["@type"]).some((t) => /HowToSection$/i.test(String(t)))) {
+        const title = cleanText(node.name);
+        if (title) out.push(title + ":");
+        instructionLines(node.itemListElement, out, depth + 1);
+      } else {
+        instructionLines(node.text || node.name || "", out, depth + 1);
+      }
+    }
+    return out;
+  }
+
+  const GUESS = [["breakfast", /(^|[^a-z0-9_])(breakfast|brunch)(?![a-z0-9_])/i], ["sides", /(^|[^a-z0-9_])(sides?|side dish)(?![a-z0-9_])/i],
+    ["lunch", /(^|[^a-z0-9_])(lunch|sandwich|salad|soup)(?![a-z0-9_])/i]];
+
+  /** Categories for an imported recipe, from what the site calls it. Dinner unless it says otherwise. */
+  function guessTypes(recipe) {
+    const text = asList(recipe.recipeCategory).concat(asList(recipe.name)).map(cleanText).join(" ");
+    const types = GUESS.filter(([, rx]) => rx.test(text)).map(([t]) => t);
+    return types.length ? types : ["dinner"];
+  }
+
+  /**
+   * Read the recipe from a web page's HTML. Returns {name, thumb, ingredients: [lines], parts: [{q, n}],
+   * instructions, url, notes, types}, or null when the page has no recipe data we can read.
+   */
+  function extractRecipe(html, pageUrl) {
+    const rx = /<script\b[^>]*type\s*=\s*["']?application\/ld\+json["']?[^>]*>([\s\S]*?)<\/script>/gi;
+    let recipe = null, m;
+    while (!recipe && (m = rx.exec(html || ""))) {
+      const raw = m[1].replace(/^\s*<!--|-->\s*$/g, "").replace(/^\s*\/\/<!\[CDATA\[|\/\/\]\]>\s*$/g, "").trim();
+      let data = null;
+      try { data = JSON.parse(raw); } catch {
+        try { data = JSON.parse(raw.replace(/[\u0000-\u001f]+/g, " ")); } catch { data = null; }
+      }
+      recipe = findRecipe(data, 0);
+    }
+    if (!recipe) return null;
+    const name = cleanText(asList(recipe.name)[0]);
+    if (!name) return null;
+    const lines = [];
+    for (const x of asList(recipe.recipeIngredient || recipe.ingredients)) {
+      for (const part of (typeof x === "string" ? x.split(/\r?\n/) : [])) {
+        const t = cleanText(part);
+        if (t && lines[lines.length - 1] !== t) lines.push(t);
+      }
+    }
+    const ingredients = lines.slice(0, 80);
+    const servings = cleanText(asList(recipe.recipeYield).map(String).find((y) => /[0-9]/.test(y)) || asList(recipe.recipeYield)[0] || "");
+    const time = formatDuration(recipe.totalTime) || formatDuration(recipe.cookTime) || "";
+    let site = "";
+    try { site = new URL(pageUrl).hostname.replace(/^www\./, ""); } catch { site = ""; }
+    const notes = [servings ? (/^[0-9]+$/.test(servings) ? "Serves " + servings : servings) : "", time, site ? "from " + site : ""]
+      .filter(Boolean).join(" \u00b7 ");
+    return {
+      name, thumb: imageUrl(recipe.image, pageUrl), ingredients, parts: ingredients.map(parseIngredientLine),
+      instructions: instructionLines(recipe.recipeInstructions, [], 0).join("\n"), url: pageUrl, notes,
+      types: guessTypes(recipe),
+    };
+  }
+
+  /** A meal's ingredients as editable lines ("2 cloves garlic"). */
+  function ingredientLines(meal) {
+    if (meal && meal.ingredients && meal.ingredients.length) return meal.ingredients.slice();
+    return ((meal && meal.parts) || []).map((p) => (p.q + " " + p.n).trim());
+  }
+
+  /**
+   * Save edited ingredient lines and steps onto a meal. Unchanged lines keep their original split into
+   * amount and name; edited lines are split again. Must match apply_recipe_edits() in meal_planner.pyw.
+   */
+  function applyRecipeEdits(meal, ingredientsText, instructions) {
+    const lines = String(ingredientsText || "").split(/\r?\n/).map((l) => cleanText(l)).filter(Boolean);
+    const before = ingredientLines(meal);
+    const oldParts = meal.parts && meal.parts.length === before.length ? meal.parts : before.map(parseIngredientLine);
+    const out = Object.assign({}, meal, {
+      ingredients: lines,
+      parts: lines.map((l) => { const i = before.indexOf(l); return i >= 0 ? oldParts[i] : parseIngredientLine(l); }),
+      instructions: String(instructions || "").replace(/\r\n/g, "\n").trim(),
+    });
+    if (!lines.length) { delete out.ingredients; delete out.parts; }
+    if (!out.instructions) delete out.instructions;
+    return out;
+  }
+
+  /** A web address the user pasted, tidied up, or "" if it isn't one. */
+  function normalizeUrl(text) {
+    const t = String(text || "").trim().replace(/^<|>$/g, "");
+    const found = t.match(/https?:\/\/[^\s"'<>]+/i);
+    const candidate = found ? found[0] : /^[\w-]+(\.[\w-]+)+(\/\S*)?$/.test(t) ? "https://" + t : "";
+    try { const u = new URL(candidate); return /^https?:$/.test(u.protocol) ? u.href : ""; } catch { return ""; }
+  }
+
   // ------------------------------------------------------------ dates (weeks run Saturday -> Friday)
 
   const pad = (n) => String(n).padStart(2, "0");
@@ -415,14 +595,15 @@
     }
     get configured() { return !!(this.url && this.key && !this.url.includes("YOUR-PROJECT")); }
 
-    async request(path, body, token) {
+    /** POST JSON (or, with `type`, raw bytes such as a photo) and return the JSON reply. */
+    async request(path, body, token, type) {
       if (!this.configured) throw new SyncError("Family sharing isn't set up in this copy of the app yet.");
       let resp;
       try {
         resp = await this.fetch(this.url + path, {
-          method: "POST", cache: "no-store", body: JSON.stringify(body || {}),
+          method: "POST", cache: "no-store", body: type ? body : JSON.stringify(body || {}),
           // Publishable keys go only in `apikey`; Authorization carries a signed-in person's token.
-          headers: Object.assign({ apikey: this.key, "Content-Type": "application/json" }, token ? { Authorization: "Bearer " + token } : {}),
+          headers: Object.assign({ apikey: this.key, "Content-Type": type || "application/json" }, token ? { Authorization: "Bearer " + token } : {}),
         });
       } catch {
         throw new SyncError("Couldn't connect \u2014 check your internet connection.");
@@ -438,24 +619,21 @@
       throw err;
     }
 
-    /** Email a 6-digit sign-in code. */
-    async sendCode(email) {
+    /**
+     * Sign this device in (Supabase "anonymous sign-in"): it gets its own private account with no email or
+     * password. The session is the device's key to its family, so the apps keep it until the device leaves.
+     */
+    async signInAnonymously() {
       try {
-        await this.request("/auth/v1/otp", { email: email.trim(), create_user: true });
+        return this.toSession(await this.request("/auth/v1/signup", { data: {} }));
       } catch (e) {
-        if (e.status === 429) throw new SyncError("Too many codes requested \u2014 wait a minute and try again.");
-        if (e.status === 400 || e.status === 422) throw new SyncError("That email address doesn't look right.");
-        throw e;
-      }
-    }
-
-    /** Check the emailed code; returns a session to keep. */
-    async verifyCode(email, code) {
-      try {
-        return this.toSession(await this.request("/auth/v1/verify",
-          { type: "email", email: email.trim(), token: String(code).replace(/\s/g, "") }));
-      } catch (e) {
-        if (e.status && e.status < 500) throw new SyncError("That code didn't work. Check it, or send a new one.");
+        if (e.status === 422 || e.status === 400 || /anonymous/i.test(e.message)) {
+          const err = new SyncError("Family sharing needs anonymous sign-ins turned on in Supabase " +
+            "(Authentication \u2192 Sign In / Providers \u2192 Allow anonymous sign-ins).");
+          err.anonymousOff = true;
+          throw err;
+        }
+        if (e.status === 429) throw new SyncError("Too many devices signed in from here recently \u2014 try again in a while.");
         throw e;
       }
     }
@@ -481,6 +659,33 @@
     }
 
     rpc(name, args, token) { return this.request("/rest/v1/rpc/" + name, args, token); }
+
+    /** The web address anyone can view a stored photo at. */
+    photoUrl(path) { return this.url + "/storage/v1/object/public/" + PHOTO_BUCKET + "/" + path; }
+  }
+
+  // Photos added from a phone or computer are shrunk before they're saved: to PHOTO_MAX pixels when they go
+  // in the family's online folder, or PHOTO_LOCAL_MAX when there's no family and the photo is kept inside the meal.
+  const PHOTO_BUCKET = "meal-photos", PHOTO_MAX = 800, PHOTO_LOCAL_MAX = 480, PHOTO_QUALITY = 0.75;
+  /** Width and height to shrink a w x h photo to, so its longest side is at most `max`. */
+  function photoSize(w, h, max) {
+    const k = Math.min(1, (max || PHOTO_MAX) / Math.max(w, h, 1));
+    return { width: Math.max(1, Math.round(w * k)), height: Math.max(1, Math.round(h * k)) };
+  }
+  /** A new file name in the family's photo folder: "<family id>/<time>-<random>.jpg". */
+  const photoPath = (familyId) => familyId + "/" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10) + ".jpg";
+  const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  /** Base64 text (or a data: URL) to bytes, for uploading a photo the phone gave us as base64. */
+  function base64ToBytes(b64) {
+    const clean = String(b64).replace(/^data:[^,]*,/, "").replace(/[^A-Za-z0-9+/]/g, "");
+    const out = new Uint8Array(Math.floor(clean.length * 3 / 4));
+    let bits = 0, acc = 0, j = 0;
+    for (let i = 0; i < clean.length; i++) {
+      acc = (acc << 6) | B64.indexOf(clean[i]);
+      bits += 6;
+      if (bits >= 8) { bits -= 8; out[j++] = (acc >> bits) & 255; }
+    }
+    return out.subarray(0, j);
   }
 
   /**
@@ -490,6 +695,12 @@
   class FamilyAccount {
     constructor(sb, auth) { this.sb = sb; this.auth = auth; }
     get signedIn() { return !!(this.auth.get() && this.auth.get().refresh_token); }
+
+    /** Sign this device in if it isn't yet (there are no emails or passwords). */
+    async ensureSignedIn() {
+      if (!this.signedIn) this.auth.set(await this.sb.signInAnonymously());
+      return this.auth.get();
+    }
 
     async token() {
       let session = this.auth.get();
@@ -514,6 +725,29 @@
     }
 
     myFamilies() { return this.call("my_families"); }
+    /** Fetch a recipe web page through the family's "import-recipe" Edge Function (for the web app). */
+    async fetchPage(url) {
+      try {
+        return await this.sb.request("/functions/v1/import-recipe", { url }, await this.token());
+      } catch (e) {
+        if (e.status === 404) throw new SyncError("Recipe import isn't set up for the web app yet (the import-recipe function).");
+        throw e;
+      }
+    }
+    /** Save a JPEG photo (bytes or Blob) in the family's folder; returns its web address. */
+    async uploadPhoto(familyId, bytes) {
+      const path = photoPath(familyId);
+      try {
+        await this.sb.request("/storage/v1/object/" + PHOTO_BUCKET + "/" + path, bytes, await this.token(), "image/jpeg");
+      } catch (e) {
+        if (e.status === 404 || /bucket not found/i.test(e.message))
+          throw new SyncError("Photo uploads aren't set up yet — run the latest supabase/schema.sql.");
+        if (e.status === 403 || /row-level security|violates/i.test(e.message))
+          throw new SyncError("Couldn't save the photo — you're not in this family any more.");
+        throw e;
+      }
+      return this.sb.photoUrl(path);
+    }
     createFamily(name, displayName) { return this.call("create_family", { p_name: name, p_display_name: displayName || "" }); }
     createInvite(familyId) { return this.call("create_invite", { p_family: familyId }); }
     joinFamily(code, displayName) { return this.call("join_family", { p_code: code, p_display_name: displayName || "" }); }
@@ -542,6 +776,24 @@
     }
   }
 
+  // Family roles: the computer that started the family is the owner; the first phone to join is the primary
+  // household member. Both can invite and remove people.
+  const ROLE_LABELS = { owner: "Family computer", primary: "Primary", member: "" };
+  const canManage = (family) => !!family && (family.role === "owner" || family.role === "primary");
+
+  /**
+   * An invite QR code as an SVG path. `qrcode` is the qrcode-generator library (docs/vendor/qrcode.js).
+   * Returns {size, path}: draw `path` in a size x size viewBox (it includes the 2-module quiet zone).
+   */
+  function qrSvgPath(qrcode, text) {
+    const qr = qrcode(0, "M");
+    qr.addData(text);
+    qr.make();
+    const n = qr.getModuleCount(), parts = [];
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (qr.isDark(r, c)) parts.push(`M${c + 2} ${r + 2}h1v1h-1z`);
+    return { size: n + 4, path: parts.join("") };
+  }
+
   /** "ABCD-EFGH" style for display; accepts codes typed any way. */
   const formatInviteCode = (code) => { const c = String(code || "").toUpperCase().replace(/[^A-Z0-9]/g, ""); return c.length === 8 ? c.slice(0, 4) + "-" + c.slice(4) : c; };
 
@@ -549,7 +801,8 @@
     API, DAYS, SOURCES, MEAL_TYPES, FAV_TABS, TYPE_TAGS, PROTEINS, ALL_CUISINES, AREA_FIX, REGIONS,
     PLAN_KEYS, SETTINGS_KEYS, mealTypes, proteins, parseMeal, CATEGORIES, fetchIndex, fetchDetails, searchIngredient, thumbUrl, isoDate, parseIso,
     addDays, weekStartOf, shortDate, dateRange, clone, normalizeData, slimMeal, canonical, stamp, mergeData,
-    shuffled, pickAvoiding, weekText, AISLES, aisleOf, ingredientKey, mealParts, addToList, parseQuickItem, SyncError, Supabase, FamilyAccount, FamilyStore, formatInviteCode, sleep,
+    shuffled, pickAvoiding, weekText, AISLES, aisleOf, ingredientKey, mealParts, addToList, parseQuickItem, cleanText, parseIngredientLine, formatDuration, extractRecipe, normalizeUrl, ingredientLines, applyRecipeEdits, SyncError, Supabase, FamilyAccount, FamilyStore, formatInviteCode, ROLE_LABELS, canManage, qrSvgPath, sleep,
+    PHOTO_MAX, PHOTO_LOCAL_MAX, PHOTO_QUALITY, photoSize, photoPath, base64ToBytes,
   };
   if (typeof module !== "undefined" && module.exports) module.exports = MP;
   else root.MP = MP;

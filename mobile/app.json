@@ -26,7 +26,15 @@
       "expo-router",
       "expo-image",
       "expo-sqlite",
-      "expo-font"
+      "expo-font",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Meal Planner uses your photos so you can add a picture to a meal.",
+          "cameraPermission": "Meal Planner uses the camera so you can take a picture of a meal.",
+          "microphonePermission": false
+        }
+      ]
     ],
     "scheme": "mealplanner",
     "experiments": {

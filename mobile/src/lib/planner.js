@@ -4,9 +4,10 @@
 // The planner is one store that lives outside React. Screens call usePlanner() to read it and
 // re-render when it changes; the root layout calls usePlannerLifecycle() once to start syncing.
 import { useEffect, useSyncExternalStore } from "react";
-import { AppState } from "react-native";
+import { AppState, Platform } from "react-native";
+import { ImageManipulator, SaveFormat } from "expo-image-manipulator";
 import { storage } from "./storage";
-import { SUPABASE_ANON_KEY, SUPABASE_URL } from "./config";
+import { SUPABASE_ANON_KEY, SUPABASE_URL, WEB_APP_URL } from "./config";
 import { startRealtime, stopRealtime, updateRealtimeToken } from "./realtime";
 
 const MP = require("./core");
@@ -27,7 +28,7 @@ function createPlanner() {
     family: storage.get("mp.family", null),
     lastSync: storage.get("mp.lastSync", 0),
     syncState: "off", syncDetail: "", syncing: false, syncAgain: false, syncTimer: null,
-    toast: null, pendingInvite: null,
+    toast: null, pendingInvite: storage.get("mp.pendingInvite", null), pendingImport: null,
   };
 
   // Screens re-render when `version` changes.
@@ -267,14 +268,19 @@ function createPlanner() {
     notify(`♥ Saved “${meal.name}”`);
   }
 
-  /** Add or update a favorite from the editor. Returns an error message, or null when saved. */
-  function saveFavorite(fields, uid) {
+  /**
+   * Add or update a favorite from the editor (also the review step of an imported recipe, `draft`).
+   * Returns an error message, or null when saved.
+   */
+  function saveFavorite(fields, uid, draft) {
     const name = fields.name.trim();
     if (!name) return "Give the meal a name.";
     if (S.data.favorites.some((f) => f.name.toLowerCase() === name.toLowerCase() && f.uid !== uid)) return `“${name}” is already in Favorites.`;
     if (!fields.types.length) return "Pick at least one category.";
     const existing = uid ? favByUid(uid) : null;
-    const meal = { ...(existing || {}), name, types: fields.types, url: fields.url.trim(), thumb: fields.thumb.trim(), notes: fields.notes.trim() };
+    const base = { ...(existing || draft || {}), name, types: fields.types, url: fields.url.trim(), thumb: fields.thumb.trim(), notes: fields.notes.trim() };
+    delete base.origin;
+    const meal = MP.applyRecipeEdits(base, fields.ingredients, fields.instructions);
     const i = existing ? S.data.favorites.findIndex((f) => f.uid === uid) : -1;
     if (i >= 0) S.data.favorites[i] = meal; else S.data.favorites.push(meal);
     save();
@@ -440,17 +446,7 @@ function createPlanner() {
     }
   }
 
-  async function sendCode(email) { await sb.sendCode(email); }
-
-  async function verifyCode(email, code) {
-    S.session = await sb.verifyCode(email, code);
-    storage.set("mp.session", S.session);
-    const families = await account.myFamilies();
-    if (families.length) await enterFamily(families[0], true);
-    redraw();
-  }
-
-  /** After creating or joining: newly joined phones take the family's week plan and settings. */
+  /** After joining: newly joined phones take the family's week plan and settings. */
   async function enterFamily(family, joining) {
     if (joining) { S.data.plan_updated = 0; S.data.settings_updated = 0; }
     setFamily(family);
@@ -459,17 +455,86 @@ function createPlanner() {
     rollOverWeek();
   }
 
-  async function createFamily(name, displayName) {
-    const fam = await account.createFamily(name, displayName);
-    await enterFamily(fam, false);
-    notify(`Created “${fam.name}” — now invite your family`);
-  }
-
-  async function joinFamily(code, displayName) {
-    const fam = await account.joinFamily(code, displayName);
+  /**
+   * Join a family with an invite code and a family member name. The phone signs itself in (Supabase
+   * "anonymous sign-in" — no email or password). Families are started on the desktop app.
+   */
+  async function joinWithInvite(code, name) {
+    if (!String(name || "").trim()) throw new Error("Enter a family member name.");
+    await account.ensureSignedIn();
+    const fam = await account.joinFamily(code, name.trim());
     await enterFamily(fam, true);
+    clearPendingInvite();
     notify(`Joined “${fam.name}”`);
   }
+
+  /** A link to join the family, for invite QR codes and messages: the web app (opens on any phone's camera). */
+  const inviteLink = (code) => (WEB_APP_URL ? WEB_APP_URL + "#join=" + code : "");
+
+  // ---- importing recipes from websites
+
+  const BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+  };
+
+  /**
+   * Shrink a photo from the camera or photo library ({uri, width, height}). In a family it's saved online so
+   * everyone sees it; otherwise it's kept inside the meal. Returns the meal's new photo address.
+   */
+  async function savePhoto(asset) {
+    const online = familyReady();
+    const size = MP.photoSize(asset.width || MP.PHOTO_MAX, asset.height || MP.PHOTO_MAX, online ? MP.PHOTO_MAX : MP.PHOTO_LOCAL_MAX);
+    const context = ImageManipulator.manipulate(asset.uri);
+    if (asset.width && size.width < asset.width) context.resize(size);
+    const image = await context.renderAsync();
+    const out = await image.saveAsync({ format: SaveFormat.JPEG, compress: MP.PHOTO_QUALITY, base64: true });
+    if (!online) return "data:image/jpeg;base64," + out.base64;
+    return account.uploadPhoto(S.family.family_id, MP.base64ToBytes(out.base64));
+  }
+
+  /** Read the recipe on a web page. Returns a draft favorite, or throws with a message to show. */
+  async function importRecipe(link) {
+    const url = MP.normalizeUrl(link);
+    if (!url) throw new Error("That doesn't look like a web address.");
+    let html, finalUrl = url;
+    if (Platform.OS === "web") {
+      if (!S.session) throw new Error("In a browser, importing needs you to be in a family first (Family tab).");
+      const page = await account.fetchPage(url);
+      html = page.html;
+      finalUrl = page.url || url;
+    } else {
+      let resp;
+      try {
+        resp = await fetch(url, { headers: BROWSER_HEADERS });
+      } catch {
+        throw new Error("Couldn't open that page — check the link and your connection.");
+      }
+      if (!resp.ok) {
+        // Some sites turn phones away; the family's import helper (if set up) may still get it.
+        if (S.session && [401, 403, 429].includes(resp.status)) {
+          try {
+            const page = await account.fetchPage(url);
+            const viaHelper = MP.extractRecipe(page.html, page.url || url);
+            if (viaHelper) return viaHelper;
+          } catch {
+            // fall through to the message below
+          }
+        }
+        throw new Error([401, 403, 429].includes(resp.status) ? "That site turned the app away."
+          : resp.status === 404 ? "That page couldn't be found." : `The site answered with error ${resp.status}.`);
+      }
+      html = await resp.text();
+      finalUrl = resp.url || url;
+    }
+    const recipe = MP.extractRecipe(html, finalUrl);
+    if (!recipe) throw Object.assign(new Error("That page doesn't include recipe details the app can read."), { manualUrl: url });
+    return recipe;
+  }
+
+  const setPendingImport = (url) => { S.pendingImport = url; redraw(); };
+  const takePendingImport = () => { const url = S.pendingImport; S.pendingImport = null; return url; };
 
   async function refreshFamily() {
     if (!familyReady()) return;
@@ -501,14 +566,14 @@ function createPlanner() {
     storage.remove("mp.session");
     setFamily(null);
     S.syncState = "off";
-    if (expired) notify("You've been signed out. Sign in again on the Family tab.");
+    if (expired) notify("This phone lost its family connection. Ask for a new invite on the Family tab.");
     redraw();
   }
 
   // ------------------------------------------------------------ start-up & staying fresh
 
-  const setPendingInvite = (code) => { S.pendingInvite = code; redraw(); };
-  const clearPendingInvite = () => { S.pendingInvite = null; };
+  const setPendingInvite = (code) => { S.pendingInvite = code; storage.set("mp.pendingInvite", code); redraw(); };
+  function clearPendingInvite() { S.pendingInvite = null; storage.remove("mp.pendingInvite"); }
 
   /** Load the recipe list, sync, and keep syncing while the app is open. Returns a cleanup function. */
   function start() {
@@ -533,7 +598,8 @@ function createPlanner() {
     addFavorite, saveFavorite, removeFavorite, toggleFavType,
     setType, setCuisine, toggleLeaveOut, reshuffleExplore, exploreVisible, cuisineOptions, cuisineLabel,
     addIngredients, quickAdd, toggleItem, removeItem, clearChecked, plannedMeals,
-    familyConfigured: sb.configured, sendCode, verifyCode, createFamily, joinFamily, refreshFamily, createInvite,
+    familyConfigured: sb.configured, joinWithInvite, inviteLink, refreshFamily, createInvite,
+    importRecipe, setPendingImport, takePendingImport, savePhoto,
     removeMember, setDisplayName, leaveFamily, signOut, syncNow,
   };
 }

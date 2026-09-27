@@ -13,6 +13,7 @@ export default function RootLayout() {
       <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: C.bg } }}>
         <Stack.Screen name="(tabs)" />
         <Stack.Screen name="join/[code]" options={{ presentation: "modal" }} />
+        <Stack.Screen name="import" options={{ presentation: "modal" }} />
       </Stack>
       <Toast message={P.S.toast} />
       <StatusBar style="dark" />

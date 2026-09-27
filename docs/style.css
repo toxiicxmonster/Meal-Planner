@@ -172,6 +172,14 @@ label.check input { width: 18px; height: 18px; accent-color: var(--accent); }
 .form { display: grid; gap: 12px; margin-top: 8px; }
 .form label.field { display: grid; gap: 4px; font-weight: 700; font-size: 14px; }
 .form .note { font-weight: 400; color: var(--muted); font-size: 12px; }
+.form div.field { display: grid; gap: 6px; font-size: 14px; }
+.banner.invite .qr { display: block; width: 220px; max-width: 100%; margin: 8px auto 10px; border-radius: 8px; }
+.photo-pick { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.photo-pick img { width: 120px; height: 90px; object-fit: cover; border-radius: 10px; border: 1px solid var(--border); }
+.photo-btns { display: flex; gap: 8px; flex-wrap: wrap; }
+.photo-btns label.btn { cursor: pointer; }
+.photo-link summary { color: var(--muted); font-size: 13px; cursor: pointer; }
+.photo-link input { margin-top: 6px; width: 100%; }
 .checks { display: flex; flex-wrap: wrap; gap: 12px; font-weight: 400; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
 .actions .btn { flex: 1; }

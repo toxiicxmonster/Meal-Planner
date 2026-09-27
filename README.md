@@ -10,7 +10,7 @@ There are three apps, and they all share your family's data:
 | **Desktop app** | Windows (also Mac and Linux) | `meal_planner.pyw` |
 | **Web app** | any phone or computer browser | `docs/` |
 
-Recipes and photos come from [TheMealDB](https://www.themealdb.com), a free recipe database. Family sharing runs on [Supabase](https://supabase.com), a hosted database with a free tier.
+Recipes and photos come from [TheMealDB](https://www.themealdb.com), a free recipe database, or from any recipe website you import. Family sharing runs on [Supabase](https://supabase.com), a hosted database with a free tier. Nobody needs an email address or password.
 
 ## What it does
 
@@ -21,8 +21,11 @@ Recipes and photos come from [TheMealDB](https://www.themealdb.com), a free reci
   - **Send** the menu by text, Messenger or email.
 - **Explore**: browse TheMealDB's recipes (about 790), loaded live each time you open the app. Filter by meal type and by cuisine or region, leave out seafood, poultry, beef, pork, lamb or vegetarian dishes, and search by dish or ingredient.
 - **Favorites**: your own meals in Dinner, Lunch, Breakfast and Sides tabs. A meal can be in more than one.
+  - **Import** a recipe from a website by pasting its link: the name, photo, ingredients and steps come in for you to check.
+  - **Edit** any meal's ingredients and recipe steps.
+  - **Add a photo** straight from your phone's camera or photo library, or from a file on the computer.
 - **Shopping list**: add ingredients from any recipe or the whole week, grouped by store aisle, with duplicates combined ("Onion — 2 + 1" for Tacos and Chili). Check items off as they go in the cart.
-- **Family**: sign in with an emailed code (no password), start a family, and invite people with an 8-character code. The owner can remove members.
+- **Family**: the desktop app sets up the family and shows a QR code. The first phone to scan it becomes the **primary household member**, who can invite everyone else with their own QR code. No emails or passwords.
 
 ---
 
@@ -33,7 +36,7 @@ Do these in order. Part 1 is done once by whoever runs the app for the family.
 1. [Set up family sharing (Supabase)](#1-set-up-family-sharing-supabase) (once)
 2. [Put the app on your iPhones](#2-put-the-app-on-your-iphones)
 3. [Run the desktop app](#3-run-the-desktop-app) (optional)
-4. [Create your family and invite people](#4-create-your-family-and-invite-people)
+4. [Set up your family and invite people](#4-set-up-your-family-and-invite-people)
 
 You'll need **Node.js** (LTS, from [nodejs.org](https://nodejs.org)) and **Python 3.10+** (from [python.org](https://www.python.org/downloads/); on Windows tick **"Add python.exe to PATH"**). Download this project with **Code → Download ZIP** on GitHub, or `git clone https://github.com/toxiicxmonster/Meal-Planner.git`.
 
@@ -41,17 +44,11 @@ You'll need **Node.js** (LTS, from [nodejs.org](https://nodejs.org)) and **Pytho
 
 1. **Create a project.** Sign up at [supabase.com](https://supabase.com) and click **New project**. The free plan is plenty. Pick any name, set a database password (you won't need it again), and choose the region closest to you.
 2. **Create the tables and rules.** In your project, open **SQL Editor → New query**. Paste in everything from [`supabase/schema.sql`](supabase/schema.sql) and click **Run**. It should say *Success*. Running it again later is safe.
-3. **Make sign-in emails show a code.** By default Supabase emails a sign-in *link*; the apps use a 6-digit *code* instead.
-   - Go to **Authentication**, find the **email templates**, and open **Magic Link**.
-   - Replace the message with:
-     ```html
-     <h2>Your Meal Planner sign-in code</h2>
-     <p>Enter this code in the app: <strong>{{ .Token }}</strong></p>
-     ```
-   - Save.
-4. **Let sign-in emails reach your family.** Supabase's built-in email only delivers to people on your Supabase project's team, and only **2 emails per hour**.
-   - **Just your family:** invite your partner to your Supabase organization (**Organization settings → Team → Invite**). They don't need to do anything in Supabase; being on the team lets the code emails reach them. Sign in on each device a few minutes apart.
-   - **Publishing the app to other people:** set up your own email sending under **Authentication → SMTP Settings**, using any email service (for example Resend or Brevo, which have free tiers).
+3. **Let devices sign in without email.** Go to **Authentication → Sign In / Providers** and turn on **Allow anonymous sign-ins**. Each phone and computer then gets its own private account automatically. Nobody types an email or password.
+4. **Recipe import for the web app** (optional; the iPhone and desktop apps don't need this). Browsers can't read other websites directly, so the web app asks a small Supabase **Edge Function** to fetch the recipe page.
+   - In Supabase, open **Edge Functions → Deploy a new function → Via Editor**.
+   - Name it exactly `import-recipe`, paste in everything from [`supabase/functions/import-recipe/index.ts`](supabase/functions/import-recipe/index.ts), and click **Deploy**.
+   - Or, with the Supabase CLI: `npx supabase functions deploy import-recipe --project-ref YOUR-PROJECT-ID`.
 5. **Connect the apps to your project.**
    - In **Project Settings → API Keys**, copy the **Project URL** and the **publishable key** (it starts with `sb_publishable_`).
    - In a terminal in the project folder, run:
@@ -59,8 +56,12 @@ You'll need **Node.js** (LTS, from [nodejs.org](https://nodejs.org)) and **Pytho
      python supabase/set_config.py https://YOUR-PROJECT.supabase.co sb_publishable_xxxxxxxx
      ```
    - This writes the settings for all three apps: `supabase/config.json`, `mobile/src/lib/config.js` and `docs/config.js`.
+   - If you publish the web app (see [Web app](#web-app-optional)), add its address as a third value, so invite QR codes open it:
+     ```
+     python supabase/set_config.py https://YOUR-PROJECT.supabase.co sb_publishable_xxxxxxxx https://YOURNAME.github.io/Meal-Planner/
+     ```
 
-   The publishable key is meant to be inside apps. The security rules from step 2 decide what each person can see: only members of a family can read or change that family's data.
+   The publishable key is meant to be inside apps. The security rules from step 2 decide what each person can see: only members of a family can read or change that family's data. Meal photos go in a `meal-photos` storage folder for each family; `schema.sql` creates it.
 
 ### 2. Put the app on your iPhones
 
@@ -89,9 +90,7 @@ Apple only allows your own apps onto iPhones through its **Apple Developer Progr
 
 **Updating later:** run the `build` and `submit` commands again. TestFlight offers the new version to both phones.
 
-**Publishing to the App Store** uses the same builds; submit one for review in App Store Connect. Before you do:
-- set up your own email sending (step 1.4);
-- add a privacy policy page. The app stores each person's email address and the family's meals.
+**Publishing to the App Store** uses the same builds; submit one for review in App Store Connect. This version has no user accounts on purpose. [`PUBLISHING-NOTES.md`](PUBLISHING-NOTES.md) lists what to add first: real accounts with email, account deletion, a privacy policy, and abuse protection.
 
 ### 3. Run the desktop app
 
@@ -103,27 +102,22 @@ Apple only allows your own apps onto iPhones through its **Apple Developer Progr
 
 Recipes load live from TheMealDB when the app opens (a second or two). Your data is saved next to the app in `meal_data.json`.
 
-### 4. Create your family and invite people
+### 4. Set up your family and invite people
 
-On whichever device has the meals you want to keep (usually the desktop, if you've been using it):
+The **desktop app** is the family's "brain": it sets up the family. Do this on the computer that has the meals you want to keep.
 
-1. **Sign in.**
-   - **iPhone:** open the **Family** tab.
-   - **Desktop:** click **⇅ Family** at the top.
+1. **Set up the family.** Click **⇅ Family** at the top. Enter a family name (e.g. *The McCrearys*) and your family member name, then click **Set up family**. Your current meals, favorites and list become the family's.
+2. **Invite the first phone.** Click **Invite someone**. A QR code appears.
+   - On the phone, point the **Camera** at the code and tap the link. The app opens with the invite filled in.
+   - Enter a **Family member name** (e.g. *Wife*) and tap **Join family**.
+   - That phone is now the **primary household member**.
+3. **Invite everyone else.** The primary household member can open **Family → Invite someone** on their phone to show a QR code, or tap **Send invite…** to text the link. The desktop can invite people too.
+   - Codes like **`XY3T-78JV`** work for 7 days, for as many people as you like. People can also type the code on the **Family** tab.
+   - A phone that joins takes the family's week plan. Anything it had already saved (favorites, list items) is added to the family's.
 
-   Enter your email and tap **Email me a code**, then type in the 6-digit code from the email.
-2. **Start a family.** Tap **Start a family**, give it a name (e.g. *The McCrearys*) and your first name. Your current meals, favorites and list become the family's.
-3. **Invite someone.**
-   - Tap **Invite someone**. You get a code like **`XY3T-78JV`**, which works for 7 days.
-   - The iPhone app opens the share sheet so you can text it; the desktop has **Copy invite message**.
-4. **On the other person's phone:**
-   - open the **Family** tab;
-   - sign in with their own email;
-   - tap **Join a family** and enter the code.
+**Who can do what:** the desktop (**Family computer**) and the **Primary** member can invite and remove people. Everyone else can use and change the plan, favorites and list, and can leave. The family computer can't be removed.
 
-   Their phone takes the family's week plan. Anything they'd already saved (favorites, list items) is added to the family's.
-
-Everyone in the family now shares the same week, favorites, shopping list and settings.
+**Keep `sync_config.json`.** It's the desktop's key to the family. If it's deleted, the primary member can invite the computer back in, but it rejoins as a regular member.
 
 ---
 
@@ -140,7 +134,10 @@ Everyone in the family now shares the same week, favorites, shopping list and se
 - On the **List** tab, type extra items ("2 lemons"), tap items to check them off, and **Clear** the ones in the cart when you're done.
 
 **Favorites.**
-- Tap **Save** on any recipe, or **+** to add your own meal. You can include a photo link, recipe link and notes.
+- Tap **Save** on any recipe, or **+** to add your own meal.
+- **Import** a recipe from a website: tap **Import** (desktop: **⤓ Import from a website**) and paste the recipe's link. Check what came in, fix anything, and save.
+- **Edit** a meal to change its ingredients (one per line; they feed the shopping list) and recipe steps.
+- **Photos:** in the meal editor, tap **Take photo** or **Choose photo** (desktop: **Choose a photo…**). Photos are shrunk before saving. In a family they're stored online so everyone sees them; otherwise they're kept inside the meal. You can still paste a photo link instead.
 - Tap a meal's **Breakfast / Lunch / Dinner / Side** tags to sort it. Only meals tagged **Dinner** are used when shuffling the week.
 
 **New weeks.** Every Saturday, the current plan moves to **Last week** and a fresh menu is made. To plan early, use **Next week**.
@@ -162,13 +159,16 @@ Everyone in the family now shares the same week, favorites, shopping list and se
 
 | What you see | What to do |
 |---|---|
-| **The sign-in email never arrives** | Check spam. Supabase's built-in email only sends to people on your Supabase team, and only 2 per hour. Add them to the team or set up SMTP (step 1.4). |
-| **The email has a link, not a code** | Edit the **Magic Link** email template to include `{{ .Token }}` (step 1.3). |
+| **"Family sharing needs anonymous sign-ins turned on"** | In Supabase, turn on **Authentication → Sign In / Providers → Allow anonymous sign-ins** (step 1.3). |
+| **"Only the family computer or the primary household member can invite people"** | Ask one of them to show you an invite QR code. |
+| **"Photo uploads aren't set up yet"** | Run the latest `supabase/schema.sql` again in the SQL Editor (it's safe to re-run). |
+| **"Recipe import isn't set up for the web app yet"** | Deploy the `import-recipe` Edge Function (step 1.4), or import on the iPhone or desktop app. |
+| **"That site turned the app away"** | Some recipe sites block apps. Try the desktop app, or tap **Add it by hand instead**. |
 | **"Family sharing isn't set up yet"** | Run `python supabase/set_config.py …` (step 1.5), then rebuild the iPhone app or restart the desktop app. |
 | **"That invite code isn't valid or has expired"** | Codes last 7 days. Tap **Invite someone** for a new one. |
-| **"You've been signed out"** | Sign in again on the Family tab. Your meals stay on the device. |
+| **"Lost its family connection"** | That device's account is gone. Ask the primary member for a new invite. Your meals stay on the device. |
 | **Supabase says the project is paused** | Free projects pause after about a week with no use. Open the project in Supabase and click **Restore**. |
-| **Photos show a colored letter instead** | That meal has no photo link. Add one with **Edit** on Favorites. |
+| **Photos show a colored letter instead** | That meal has no photo. Add one with **Edit** on Favorites. |
 | **Desktop app won't start: "Missing Pillow"** | Run `python -m pip install -r requirements.txt`. |
 
 ## Web app (optional)
@@ -180,7 +180,7 @@ The `docs/` folder is the same planner as a web page. It can be installed to a p
 3. Open it on the phone.
    - **iPhone (Safari):** tap **Share → Add to Home Screen**.
    - **Android (Chrome):** tap **⋮ → Install app**.
-4. Tap **Family** at the top to sign in and join.
+4. Tap **Family** at the top and join with an invite code, or just scan an invite QR code with the phone's camera.
 
 ## Files
 
@@ -189,16 +189,19 @@ The `docs/` folder is the same planner as a web page. It can be installed to a p
 | `mobile/` | The iPhone app (Expo / React Native) | Yes |
 | `meal_planner.pyw`, `requirements.txt` | The desktop app | Yes |
 | `docs/` | The web app, published by GitHub Pages | Yes |
-| `supabase/schema.sql` | Tables, security rules and functions for family sharing | Yes |
+| `supabase/schema.sql` | Tables, security rules, functions and the photo folder for family sharing | Yes |
+| `supabase/functions/import-recipe/` | Edge Function the web app uses to read recipe pages | Yes |
+| `PUBLISHING-NOTES.md` | What to change to publish this with real user accounts | Yes |
 | `supabase/set_config.py`, `supabase/config.json` | Connects the apps to your Supabase project | Yes (the publishable key is public by design) |
 | `meal_data.json` | The desktop's copy of your meals, plans and list | **No** (personal) |
-| `sync_config.json` | The desktop's sign-in | **No** (private) |
+| `sync_config.json` | The desktop's key to the family (keep it) | **No** (private) |
 | `image_cache/` | Recipe photos the desktop has shown, kept so they load quickly | No |
 
 ## For developers
 
-- **Shared rules:** `docs/core.js` holds the planner rules shared by the web and iPhone apps: meal types, proteins, aisles, merging, and the Supabase client. The iPhone app gets a copy in `mobile/src/lib/core.js` through `npm run sync-core`, which also runs automatically on `npm start`. **Edit `docs/core.js`, not the copy.**
-- **Desktop in step:** the desktop app implements the same rules in Python (`merge_data`, `meal_types`, `proteins`, `aisle_of`, `add_to_list`, `Supabase` / `FamilyAccount` / `FamilyStore`). If you change a rule, change both, so every app merges the same way.
+- **Shared rules:** `docs/core.js` holds the planner rules shared by the web and iPhone apps: meal types, proteins, aisles, merging, recipe import, photo sizes, family roles, and the Supabase client. The iPhone app gets a copy in `mobile/src/lib/core.js` through `npm run sync-core`, which also runs automatically on `npm start`. **Edit `docs/core.js`, not the copy.**
+- **Desktop in step:** the desktop app implements the same rules in Python (`merge_data`, `meal_types`, `proteins`, `aisle_of`, `add_to_list`, `extract_recipe`, `apply_recipe_edits`, `photo_size`, `Supabase` / `FamilyAccount` / `FamilyStore`). If you change a rule, change both, so every app merges the same way.
 - **iPhone app:** it uses Expo Router (`mobile/src/app/`); the planner state is an external store in `mobile/src/lib/planner.js`. Before committing, run `npx expo lint` and `npx expo-doctor` in `mobile/`.
 - **Trying the iPhone app's screens on a computer:** run `npm run web` in `mobile/`.
 - **Web app updates:** bump `VERSION` in `docs/sw.js` so installed copies pick up the change.
+- **QR codes** on the web and iPhone apps use [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) (MIT). The web app's copy is `docs/vendor/qrcode.js`.

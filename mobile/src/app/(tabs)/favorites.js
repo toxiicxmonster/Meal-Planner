@@ -4,8 +4,8 @@ import { FlatList, Pressable, ScrollView, Text, TextInput, View } from "react-na
 import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { MP, usePlanner } from "../../lib/planner";
-import { C, Chip, Empty, MealPhoto, Title, s, tap } from "../../components/ui";
-import { EditorSheet, RecipeSheet } from "../../components/sheets";
+import { Button, C, Chip, Empty, MealPhoto, Title, s, tap } from "../../components/ui";
+import { EditorSheet, ImportSheet, RecipeSheet } from "../../components/sheets";
 
 export default function FavoritesScreen() {
   const P = usePlanner();
@@ -14,6 +14,9 @@ export default function FavoritesScreen() {
   const [query, setQuery] = useState("");
   const [recipe, setRecipe] = useState(null);
   const [editing, setEditing] = useState(undefined);
+  const [importOpen, setImportOpen] = useState(false);
+  const pendingImport = P.S.pendingImport; // a link shared into the app (mealplanner://import?url=...)
+  const closeImport = () => { P.takePendingImport(); setImportOpen(false); };
   const all = P.S.data.favorites;
   const count = (k) => all.filter((m) => k === "all" || MP.mealTypes(m).has(k)).length;
   const q = query.toLowerCase().trim();
@@ -25,7 +28,8 @@ export default function FavoritesScreen() {
 
   const header = (
     <View style={{ marginBottom: 10 }}>
-      <Title title={`Favorites${all.length ? ` (${all.length})` : ""}`} subtitle="Tap the tags on a meal to sort it." />
+      <Title title={`Favorites${all.length ? ` (${all.length})` : ""}`} subtitle="Tap the tags on a meal to sort it."
+        right={<Button small title="Import" icon="download-outline" kind="soft" onPress={() => setImportOpen(true)} />} />
       <ScrollView horizontal showsHorizontalScrollIndicator={false}>
         {MP.FAV_TABS.map(([k, l]) => <Chip key={k} label={`${l} ${count(k)}`} on={tab === k} onPress={() => setTab(k)} />)}
       </ScrollView>
@@ -85,6 +89,8 @@ export default function FavoritesScreen() {
       </Pressable>
       <RecipeSheet meal={recipe} onClose={() => setRecipe(null)} />
       <EditorSheet target={editing} onClose={() => setEditing(undefined)} />
+      <ImportSheet visible={importOpen || !!pendingImport} initialUrl={pendingImport} onClose={closeImport}
+        onImported={(draft) => { closeImport(); setEditing({ uid: null, draft }); }} />
     </SafeAreaView>
   );
 }

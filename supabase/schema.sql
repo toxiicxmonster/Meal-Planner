@@ -7,9 +7,13 @@
 --   * Each family has one planner document (week, favorites, shopping list, settings) in family_data.
 --     The apps merge edits item by item on the device, then save with a version check so two phones
 --     saving at the same moment can't overwrite each other.
---   * People join a family with an invite code. Nobody can read or change a family they aren't in:
---     row level security blocks direct access, and every change goes through the functions below,
---     which check membership first.
+--   * Nobody uses an email address. Each device signs in with Supabase's anonymous sign-in (turn it on:
+--     Authentication -> Sign In / Providers -> "Allow anonymous sign-ins"), so a device is an account.
+--   * The desktop app starts the family and is its "owner". The first phone to join with the desktop's
+--     QR code becomes the "primary" household member. The owner and the primary member can make invite
+--     codes and remove people; everyone else is a "member".
+--   * Nobody can read or change a family they aren't in: row level security blocks direct access, and
+--     every change goes through the functions below, which check membership first.
 
 -- ------------------------------------------------------------------ tables
 
@@ -24,11 +28,14 @@ create table if not exists public.family_members (
   family_id     uuid not null references public.families (id) on delete cascade,
   user_id       uuid not null references auth.users (id) on delete cascade,
   display_name  text not null default '' check (char_length(display_name) <= 40),
-  role          text not null default 'member' check (role in ('owner', 'member')),
+  role          text not null default 'member',
   joined_at     timestamptz not null default now(),
   primary key (family_id, user_id)
 );
 create index if not exists family_members_user on public.family_members (user_id);
+-- owner = the computer that started the family; primary = the first phone to join; member = everyone else
+alter table public.family_members drop constraint if exists family_members_role_check;
+alter table public.family_members add constraint family_members_role_check check (role in ('owner', 'primary', 'member'));
 
 create table if not exists public.family_invites (
   code        text primary key,
@@ -84,6 +91,13 @@ begin
   end if;
 end $$;
 
+-- The owner and the primary household member run the family: they invite and remove people.
+create or replace function public.can_manage(p_family uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from family_members
+                 where family_id = p_family and user_id = auth.uid() and role in ('owner', 'primary'));
+$$;
+
 create or replace function public.family_summary(p_family uuid)
 returns json language sql stable security definer set search_path = public as $$
   select json_build_object(
@@ -124,6 +138,9 @@ declare
   v_expires timestamptz;
 begin
   perform public.require_member(p_family);
+  if not public.can_manage(p_family) then
+    raise exception 'Only the family computer or the primary household member can invite people.' using errcode = '42501';
+  end if;
   delete from family_invites where expires_at < now();
   loop
     v_bytes := uuid_send(gen_random_uuid());  -- strong random bytes
@@ -142,7 +159,7 @@ begin
   return json_build_object('code', v_code, 'expires_at', v_expires);
 end $$;
 
--- Join a family with an invite code.
+-- Join a family with an invite code. The first person to join becomes the primary household member.
 create or replace function public.join_family(p_code text, p_display_name text default '')
 returns json language plpgsql security definer set search_path = public as $$
 declare v_family uuid;
@@ -156,7 +173,9 @@ begin
     raise exception 'That invite code isn''t valid or has expired. Ask for a new one.' using errcode = 'P0002';
   end if;
   insert into family_members (family_id, user_id, display_name, role)
-    values (v_family, auth.uid(), left(coalesce(trim(p_display_name), ''), 40), 'member')
+    values (v_family, auth.uid(), left(coalesce(trim(p_display_name), ''), 40),
+            case when exists (select 1 from family_members where family_id = v_family and role = 'primary')
+                 then 'member' else 'primary' end)
     on conflict (family_id, user_id) do nothing;
   return public.family_summary(v_family);
 end $$;
@@ -206,41 +225,58 @@ begin
   return public.family_summary(p_family);
 end $$;
 
--- Leave a family. If the owner leaves, the longest-standing member becomes owner;
--- if nobody is left, the family and its data are deleted.
-create or replace function public.leave_family(p_family uuid)
+-- Keep someone in charge: if the owner is gone the primary member takes over (or the longest-standing
+-- member), and if the primary member is gone the longest-standing member becomes primary.
+create or replace function public.fill_roles(p_family uuid)
 returns void language plpgsql security definer set search_path = public as $$
-declare v_was_owner boolean;
 begin
-  perform public.require_member(p_family);
-  delete from family_members where family_id = p_family and user_id = auth.uid()
-    returning role = 'owner' into v_was_owner;
-  if not exists (select 1 from family_members where family_id = p_family) then
-    delete from families where id = p_family;
-  elsif v_was_owner then
+  if not exists (select 1 from family_members where family_id = p_family and role = 'owner') then
     update family_members set role = 'owner'
-      where family_id = p_family
-        and user_id = (select user_id from family_members where family_id = p_family order by joined_at limit 1);
+      where family_id = p_family and user_id = (select user_id from family_members where family_id = p_family
+                                                order by role = 'primary' desc, joined_at limit 1);
+  end if;
+  if not exists (select 1 from family_members where family_id = p_family and role = 'primary') then
+    update family_members set role = 'primary'
+      where family_id = p_family and user_id = (select user_id from family_members where family_id = p_family
+                                                and role = 'member' order by joined_at limit 1);
   end if;
 end $$;
 
--- The owner can remove someone from the family.
+-- Leave a family. If nobody is left, the family and its data are deleted.
+create or replace function public.leave_family(p_family uuid)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  perform public.require_member(p_family);
+  delete from family_members where family_id = p_family and user_id = auth.uid();
+  if not exists (select 1 from family_members where family_id = p_family) then
+    delete from families where id = p_family;
+  else
+    perform public.fill_roles(p_family);
+  end if;
+end $$;
+
+-- The owner can remove anyone; the primary household member can remove anyone except the owner.
 create or replace function public.remove_member(p_family uuid, p_user uuid)
 returns json language plpgsql security definer set search_path = public as $$
 begin
   perform public.require_member(p_family);
-  if not exists (select 1 from family_members where family_id = p_family and user_id = auth.uid() and role = 'owner') then
-    raise exception 'Only the family owner can remove people.' using errcode = '42501';
+  if not public.can_manage(p_family) then
+    raise exception 'Only the family computer or the primary household member can remove people.' using errcode = '42501';
   end if;
   if p_user = auth.uid() then
     raise exception 'Use Leave family to remove yourself.' using errcode = '22023';
   end if;
+  if exists (select 1 from family_members where family_id = p_family and user_id = p_user and role = 'owner') then
+    raise exception 'The family computer can''t be removed.' using errcode = '42501';
+  end if;
   delete from family_members where family_id = p_family and user_id = p_user;
+  perform public.fill_roles(p_family);
   return public.family_summary(p_family);
 end $$;
 
 -- Only signed-in users may call the app functions.
 revoke all on function public.is_family_member(uuid), public.require_member(uuid), public.family_summary(uuid),
+  public.can_manage(uuid), public.fill_roles(uuid),
   public.create_family(text, text), public.create_invite(uuid), public.join_family(text, text),
   public.my_families(), public.get_family_data(uuid), public.put_family_data(uuid, jsonb, bigint),
   public.set_display_name(uuid, text), public.leave_family(uuid), public.remove_member(uuid, uuid)
@@ -250,6 +286,23 @@ grant execute on function public.create_family(text, text), public.create_invite
   public.set_display_name(uuid, text), public.leave_family(uuid), public.remove_member(uuid, uuid),
   public.is_family_member(uuid)
   to authenticated;
+
+-- ------------------------------------------------------------------ meal photos
+
+-- Photos taken or picked in the apps go in the public "meal-photos" bucket, one folder per family
+-- (<family id>/<file>.jpg). Anyone with a photo's link can view it; only family members can add to their folder.
+insert into storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+values ('meal-photos', 'meal-photos', true, 5242880, array['image/jpeg', 'image/png', 'image/webp'])
+on conflict (id) do update set public = true, file_size_limit = excluded.file_size_limit,
+  allowed_mime_types = excluded.allowed_mime_types;
+
+drop policy if exists "family members add meal photos" on storage.objects;
+create policy "family members add meal photos" on storage.objects
+  for insert to authenticated
+  with check (bucket_id = 'meal-photos' and case
+    when (storage.foldername(name))[1] ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+      then public.is_family_member(((storage.foldername(name))[1])::uuid)
+    else false end);
 
 -- ------------------------------------------------------------------ live updates
 

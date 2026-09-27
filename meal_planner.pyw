@@ -14,6 +14,7 @@ Your project's address is in supabase/config.json; your sign-in is kept in sync_
 Requires Pillow for photos:  python -m pip install pillow
 """
 
+import base64
 import datetime
 import hashlib
 import io
@@ -32,7 +33,7 @@ import os
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
@@ -230,8 +231,67 @@ def load_supabase_config():
         return "", ""
 
 
+def web_app_url():
+    """Where the web app is published (from supabase/config.json); invite QR codes open it on phones."""
+    try:
+        return json.loads(SUPABASE_CONFIG.read_text(encoding="utf-8")).get("webAppUrl", "")
+    except (OSError, ValueError):
+        return ""
+
+
+# Photos added from this computer are shrunk before they're saved: to PHOTO_MAX pixels when they go in the
+# family's online folder, or PHOTO_LOCAL_MAX when there's no family and the photo is kept inside the meal.
+PHOTO_BUCKET, PHOTO_MAX, PHOTO_LOCAL_MAX, PHOTO_QUALITY = "meal-photos", 800, 480, 0.75
+# owner = the computer that started the family; primary = the first phone to join (both can invite)
+ROLE_LABELS = {"owner": "Family computer", "primary": "Primary", "member": ""}
+
+
+def photo_size(w, h, max_side=PHOTO_MAX):
+    """Width and height to shrink a w x h photo to, so its longest side is at most max_side (like core.js)."""
+    k = min(1, (max_side or PHOTO_MAX) / max(w, h, 1))
+    return max(1, round_half_up(w * k)), max(1, round_half_up(h * k))
+
+
+def round_half_up(x):
+    """Math.round from JavaScript (Python's round() rounds halves to even)."""
+    return int((x + 0.5) // 1)
+
+
+def photo_path(family_id):
+    """A new file name in the family's photo folder: "<family id>/<time>-<random>.jpg"."""
+    return f"{family_id}/{base36(now_ms())}-{uuid.uuid4().hex[:8]}.jpg"
+
+
+def base36(n):
+    digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+    out = ""
+    while True:
+        n, r = divmod(n, 36)
+        out = digits[r] + out
+        if not n:
+            return out
+
+
+def shrink_photo(path, max_side):
+    """Open a photo file, turn it upright, shrink it and return JPEG bytes."""
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im)
+        if im.mode in ("RGBA", "LA", "P"):  # transparent PNGs get a white background, not black
+            im = im.convert("RGBA")
+            bg = Image.new("RGB", im.size, "white")
+            bg.paste(im, mask=im.split()[3])
+            im = bg
+        im = im.convert("RGB")
+        size = photo_size(im.width, im.height, max_side)
+        if size != im.size:
+            im = im.resize(size, Image.LANCZOS)
+        out = io.BytesIO()
+        im.save(out, "JPEG", quality=int(PHOTO_QUALITY * 100), optimize=True)
+        return out.getvalue()
+
+
 class Supabase:
-    """Sign-in with an emailed code, and calls to the functions in supabase/schema.sql (same as docs/core.js)."""
+    """Device sign-in (no email) and calls to the functions in supabase/schema.sql (same as docs/core.js)."""
 
     def __init__(self, url, key):
         self.url, self.key = (url or "").rstrip("/"), key or ""
@@ -240,15 +300,16 @@ class Supabase:
     def configured(self):
         return bool(self.url and self.key and "YOUR-PROJECT" not in self.url)
 
-    def request(self, path, body, token=None):
+    def request(self, path, body, token=None, content_type=None):
+        """POST JSON (or, with content_type, raw bytes such as a photo) and return the JSON reply."""
         if not self.configured:
             raise SyncError("Family sharing isn't set up in this copy of the app yet.")
         # Publishable keys go only in `apikey`; Authorization carries a signed-in person's token.
-        headers = {"apikey": self.key, "Content-Type": "application/json", "User-Agent": "MealPlanner"}
+        headers = {"apikey": self.key, "Content-Type": content_type or "application/json", "User-Agent": "MealPlanner"}
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        req = urllib.request.Request(self.url + path, method="POST", data=json.dumps(body or {}).encode(),
-                                     headers=headers)
+        data = body if content_type else json.dumps(body or {}).encode()
+        req = urllib.request.Request(self.url + path, method="POST", data=data, headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=20) as resp:
                 text = resp.read().decode("utf-8")
@@ -262,24 +323,17 @@ class Supabase:
         except urllib.error.URLError:
             raise SyncError("Couldn't connect \u2014 check your internet connection.")
 
-    def send_code(self, email):
+    def sign_in_anonymously(self):
+        """Sign this device in with no email or password (Supabase anonymous sign-in)."""
         try:
-            self.request("/auth/v1/otp", {"email": email.strip(), "create_user": True})
+            return self.to_session(self.request("/auth/v1/signup", {"data": {}}))
         except SyncError as e:
+            if e.status in (400, 422) or "anonymous" in str(e).lower():
+                raise SyncError("Family sharing needs anonymous sign-ins turned on in Supabase (Authentication "
+                                "\u2192 Sign In / Providers \u2192 Allow anonymous sign-ins).")
             if e.status == 429:
-                raise SyncError("Too many codes requested \u2014 wait a minute and try again.")
-            if e.status in (400, 422):
-                raise SyncError("That email address doesn't look right.")
+                raise SyncError("Too many devices signed in from here recently \u2014 try again in a while.")
             raise
-
-    def verify_code(self, email, code):
-        try:
-            r = self.request("/auth/v1/verify", {"type": "email", "email": email.strip(), "token": "".join(code.split())})
-        except SyncError as e:
-            if e.status and e.status < 500:
-                raise SyncError("That code didn't work. Check it, or send a new one.")
-            raise
-        return self.to_session(r)
 
     def refresh(self, session):
         try:
@@ -289,6 +343,10 @@ class Supabase:
                 raise SyncError("You've been signed out. Please sign in again.", signed_out=True)
             raise
         return self.to_session(r)
+
+    def photo_url(self, path):
+        """The web address anyone can view a stored photo at."""
+        return f"{self.url}/storage/v1/object/public/{PHOTO_BUCKET}/{path}"
 
     @staticmethod
     def to_session(r):
@@ -303,6 +361,12 @@ class FamilyAccount:
 
     def __init__(self, sb, get_session, set_session):
         self.sb, self.get, self.set = sb, get_session, set_session
+
+    def ensure_signed_in(self):
+        """Sign this device in if it isn't yet (there are no emails or passwords)."""
+        if not (self.get() or {}).get("refresh_token"):
+            self.set(self.sb.sign_in_anonymously())
+        return self.get()
 
     def token(self):
         session = self.get()
@@ -326,6 +390,19 @@ class FamilyAccount:
 
     def my_families(self):
         return self.call("my_families")
+
+    def upload_photo(self, family_id, jpeg_bytes):
+        """Save a JPEG in the family's photo folder; returns its web address."""
+        path = photo_path(family_id)
+        try:
+            self.sb.request(f"/storage/v1/object/{PHOTO_BUCKET}/{path}", jpeg_bytes, self.token(), "image/jpeg")
+        except SyncError as e:
+            if e.status == 404 or "bucket not found" in str(e).lower():
+                raise SyncError("Photo uploads aren't set up yet \u2014 run the latest supabase/schema.sql.")
+            if e.status == 403 or "row-level security" in str(e).lower() or "violates" in str(e).lower():
+                raise SyncError("Couldn't save the photo \u2014 you're not in this family any more.")
+            raise
+        return self.sb.photo_url(path)
 
     def create_family(self, name, display_name):
         return self.call("create_family", {"p_name": name, "p_display_name": display_name})
@@ -634,6 +711,245 @@ def add_to_list(items, adds):
     return added, combined
 
 
+# ---------------------------------------------------------------- importing recipes from websites
+# Recipe sites publish a machine-readable copy of each recipe (schema.org Recipe in JSON-LD).
+# Same rules as extractRecipe() etc. in docs/core.js.
+
+ENTITIES = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'", "nbsp": " ", "ndash": "\u2013", "mdash": "\u2014",
+            "lsquo": "\u2018", "rsquo": "\u2019", "ldquo": "\u201c", "rdquo": "\u201d", "hellip": "\u2026", "deg": "\u00b0",
+            "frac12": "\u00bd", "frac14": "\u00bc", "frac34": "\u00be", "frac13": "\u2153", "frac23": "\u2154",
+            "eacute": "\u00e9", "egrave": "\u00e8", "ecirc": "\u00ea", "agrave": "\u00e0", "ccedil": "\u00e7",
+            "ntilde": "\u00f1", "uuml": "\u00fc", "ouml": "\u00f6", "auml": "\u00e4", "times": "\u00d7", "reg": "\u00ae",
+            "copy": "\u00a9", "trade": "\u2122"}
+ENTITY_RE = re.compile(r"&(#x[0-9a-f]+|#[0-9]+|[a-z]+[0-9]*);", re.I)
+
+
+def clean_text(value):
+    """Text from a recipe page: entities decoded, tags removed, spaces tidied."""
+    t = "" if value is None else str(value)
+
+    def entity(m):
+        e = m.group(1)
+        if e[0] == "#":
+            code = int(e[2:], 16) if e[1] in "xX" else int(e[1:])
+            return chr(code) if 0 < code < 0x110000 else m.group(0)
+        return ENTITIES.get(e.lower(), m.group(0))
+    for _ in range(2):  # some sites double-encode (&amp;amp;)
+        t = ENTITY_RE.sub(entity, t)
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]*>", " ", t)).strip()
+
+
+UNITS = ("fluid ounces?|fl\\.? ?oz|tablespoons?|teaspoons?|kilograms?|milliliters?|millilitres?|ounces?|pounds?|"
+         "grams?|liters?|litres?|quarts?|pints?|cups?|tbsps?|tbs|tsps?|lbs?|oz|kg|ml|qts?|pts?|g|l|cans?|jars?|packages?|"
+         "pkgs?|packets?|bottles?|boxes?|bags?|cloves?|heads?|bunch(?:es)?|sprigs?|stalks?|sticks?|slices?|pieces?|"
+         "pinch(?:es)?|dash(?:es)?|handfuls?|large|medium|small")
+NUM = "[0-9\u00bc-\u00be\u2150-\u215e]+(?:[.,/][0-9]+)?(?:\\s+[0-9\u00bc-\u00be\u2150-\u215e]+(?:/[0-9]+)?)?"
+AMOUNT_RE = re.compile("^((?:" + NUM + ")(?:\\s*(?:-|\u2013|to)\\s*(?:" + NUM + "))?(?:\\s*\\([^)]*\\))?"
+                       "(?:\\s*(?:" + UNITS + ")(?![A-Za-z0-9_])\\.?)?(?:\\s*\\([^)]*\\))?)\\s*(.+)$", re.I)
+
+
+def parse_ingredient_line(line):
+    """"2 (14 oz) cans diced tomatoes, drained" -> {"q": "2 (14 oz) cans", "n": "diced tomatoes"}."""
+    text = re.sub("^[\u2022\u25a2\u25a1\u2610\\-*\u00b7]+\\s*", "", clean_text(line))
+    m = AMOUNT_RE.match(text)
+    q = m.group(1).strip() if m else ""
+    n = re.sub(r"\([^)]*\)", " ", m.group(2) if m else text).split(",")[0]
+    n = re.sub(r"\s+", " ", re.sub(r"^of\s+", "", n, flags=re.I)).strip()
+    return {"q": q, "n": n or text}
+
+
+def format_duration(iso):
+    """"PT1H30M" -> "1 hr 30 min"."""
+    m = re.match(r"^P(?:([0-9]+)D)?(?:T(?:([0-9]+)H)?(?:([0-9]+)M)?(?:[0-9.]+S)?)?$", str(iso or ""), re.I)
+    if not m:
+        return ""
+    h, minutes = divmod(int(m.group(1) or 0) * 1440 + int(m.group(2) or 0) * 60 + int(m.group(3) or 0), 60)
+    return " ".join(x for x in (f"{h} hr" if h else "", f"{minutes} min" if minutes else "") if x)
+
+
+def as_list(v):
+    return [] if v is None else v if isinstance(v, list) else [v]
+
+
+def js_str(v):
+    """String(v) the way JavaScript would write it, so both apps read recipes the same."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return "null" if v is None else str(v)
+
+
+def find_recipe(node, depth=0):
+    if not isinstance(node, (dict, list)) or depth > 6:
+        return None
+    if isinstance(node, list):
+        return next((r for r in (find_recipe(x, depth + 1) for x in node) if r), None)
+    if any(re.search(r"(^|[:/])recipe$", js_str(t), re.I) for t in as_list(node.get("@type"))):
+        return node
+    for key in ("@graph", "mainEntity", "mainEntityOfPage", "itemListElement"):
+        r = find_recipe(node.get(key), depth + 1)
+        if r:
+            return r
+    return None
+
+
+def image_url(img, base):
+    u = ""
+    for x in as_list(img):
+        u = x if isinstance(x, str) else (x.get("url") or x.get("contentUrl") or "") if isinstance(x, dict) else ""
+        if u:
+            break
+    if not u or not isinstance(u, str):
+        return ""
+    joined = urllib.parse.urljoin(base, clean_text(u))
+    return joined if joined.startswith(("http://", "https://")) else ""
+
+
+def instruction_lines(node, out, depth=0):
+    if depth > 5 or node is None:
+        return out
+    if isinstance(node, str):
+        for part in re.split(r"\r?\n|<br\s*/?>|</p>|</li>", node, flags=re.I):
+            t = clean_text(part)
+            if t:
+                out.append(t)
+    elif isinstance(node, list):
+        for x in node:
+            instruction_lines(x, out, depth + 1)
+    elif isinstance(node, dict):
+        if any(re.search(r"HowToSection$", js_str(t), re.I) for t in as_list(node.get("@type"))):
+            title = clean_text(node.get("name"))
+            if title:
+                out.append(title + ":")
+            instruction_lines(node.get("itemListElement"), out, depth + 1)
+        else:
+            instruction_lines(node.get("text") or node.get("name") or "", out, depth + 1)
+    return out
+
+
+GUESS = [("breakfast", re.compile(r"(^|[^a-z0-9_])(breakfast|brunch)(?![a-z0-9_])", re.I)),
+         ("sides", re.compile(r"(^|[^a-z0-9_])(sides?|side dish)(?![a-z0-9_])", re.I)),
+         ("lunch", re.compile(r"(^|[^a-z0-9_])(lunch|sandwich|salad|soup)(?![a-z0-9_])", re.I))]
+
+
+def guess_types(recipe):
+    """Categories for an imported recipe, from what the site calls it. Dinner unless it says otherwise."""
+    text = " ".join(clean_text(x) for x in as_list(recipe.get("recipeCategory")) + as_list(recipe.get("name")))
+    return [t for t, rx in GUESS if rx.search(text)] or ["dinner"]
+
+
+LD_JSON_RE = re.compile(r"<script\b[^>]*type\s*=\s*[\"']?application/ld\+json[\"']?[^>]*>([\s\S]*?)</script>", re.I)
+
+
+def extract_recipe(html, page_url):
+    """Read the recipe from a web page's HTML, or None if the page has no recipe data we can read."""
+    recipe = None
+    for m in LD_JSON_RE.finditer(html or ""):
+        raw = re.sub(r"^\s*<!--|-->\s*$", "", m.group(1))
+        raw = re.sub(r"^\s*//<!\[CDATA\[|//\]\]>\s*$", "", raw).strip()
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            try:
+                data = json.loads(re.sub("[\u0000-\u001f]+", " ", raw))
+            except ValueError:
+                data = None
+        recipe = find_recipe(data)
+        if recipe:
+            break
+    if not recipe:
+        return None
+    names = as_list(recipe.get("name"))
+    name = clean_text(names[0]) if names else ""
+    if not name:
+        return None
+    lines = []
+    for x in as_list(recipe.get("recipeIngredient") or recipe.get("ingredients")):
+        for part in (re.split(r"\r?\n", x) if isinstance(x, str) else []):
+            t = clean_text(part)
+            if t and (not lines or lines[-1] != t):
+                lines.append(t)
+    ingredients = lines[:80]
+    yields = [js_str(y) for y in as_list(recipe.get("recipeYield"))]
+    servings = clean_text(next((y for y in yields if re.search("[0-9]", y)), yields[0] if yields else ""))
+    time_text = format_duration(recipe.get("totalTime")) or format_duration(recipe.get("cookTime")) or ""
+    site = re.sub(r"^www\.", "", urllib.parse.urlparse(page_url).hostname or "")
+    notes = " \u00b7 ".join(x for x in (("Serves " + servings if re.match(r"^[0-9]+$", servings) else servings),
+                                         time_text, "from " + site if site else "") if x)
+    return {"name": name, "thumb": image_url(recipe.get("image"), page_url), "ingredients": ingredients,
+            "parts": [parse_ingredient_line(x) for x in ingredients],
+            "instructions": "\n".join(instruction_lines(recipe.get("recipeInstructions"), [])),
+            "url": page_url, "notes": notes, "types": guess_types(recipe)}
+
+
+def normalize_url(text):
+    """A web address the user pasted, tidied up, or "" if it isn't one."""
+    t = re.sub(r"^<|>$", "", (text or "").strip())
+    found = re.search(r"https?://[^\s\"'<>]+", t, re.I)
+    candidate = found.group(0) if found else ("https://" + t if re.match(r"^[\w-]+(\.[\w-]+)+(/\S*)?$", t) else "")
+    parts = urllib.parse.urlsplit(candidate)
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        return ""
+    return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path or "/", parts.query, parts.fragment))
+
+
+def ingredient_lines(meal):
+    """A meal's ingredients as editable lines ("2 cloves garlic")."""
+    if meal and meal.get("ingredients"):
+        return list(meal["ingredients"])
+    return [f"{p['q']} {p['n']}".strip() for p in (meal or {}).get("parts") or []]
+
+
+def apply_recipe_edits(meal, ingredients_text, instructions):
+    """Save edited ingredient lines and steps onto a meal. Unchanged lines keep their split into amount and
+    name; edited lines are split again. Same as applyRecipeEdits() in docs/core.js."""
+    lines = [t for t in (clean_text(x) for x in re.split(r"\r?\n", ingredients_text or "")) if t]
+    before = ingredient_lines(meal)
+    old_parts = meal["parts"] if meal.get("parts") and len(meal["parts"]) == len(before) else [parse_ingredient_line(x) for x in before]
+    out = dict(meal, ingredients=lines,
+               parts=[old_parts[before.index(x)] if x in before else parse_ingredient_line(x) for x in lines],
+               instructions=(instructions or "").replace("\r\n", "\n").strip())
+    if not lines:
+        out.pop("ingredients")
+        out.pop("parts")
+    if not out["instructions"]:
+        out.pop("instructions")
+    return out
+
+
+# Recipe sites turn away requests that don't look like a normal browser visit.
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9", "Accept-Encoding": "gzip, deflate", "Cache-Control": "no-cache",
+    "Sec-Fetch-Dest": "document", "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Site": "none", "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1", "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+    "sec-ch-ua-mobile": "?0", "sec-ch-ua-platform": '"Windows"'}
+
+
+def fetch_page(url):
+    """Download a web page like a browser would. Returns (final_url, html)."""
+    import gzip
+    import zlib
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=BROWSER_HEADERS), timeout=20) as resp:
+            raw = resp.read(8_000_000)
+            enc = resp.headers.get("Content-Encoding", "")
+            charset = resp.headers.get_content_charset() or "utf-8"
+            final = resp.geturl()
+    except urllib.error.HTTPError as e:
+        raise SyncError("That site turned the app away." if e.code in (401, 403, 429)
+                        else "That page couldn't be found." if e.code == 404 else f"The site answered with error {e.code}.")
+    except (urllib.error.URLError, OSError):
+        raise SyncError("Couldn't open that page \u2014 check the link and your internet connection.")
+    if enc == "gzip":
+        raw = gzip.decompress(raw)
+    elif enc == "deflate":
+        raw = zlib.decompress(raw)
+    return final, raw.decode(charset, "replace")
+
+
 def fetch_by_ids(ids):
     with ThreadPoolExecutor(max_workers=3) as pool:
         results = pool.map(lambda i: api_get("lookup.php", i=i), ids)
@@ -675,7 +991,9 @@ class ImageLoader:
     def _load(self, url, size, key):
         try:
             cache = CACHE_DIR / (hashlib.sha1(url.encode()).hexdigest() + ".img")
-            if cache.exists():
+            if url.startswith("data:"):  # a photo kept inside the meal
+                raw = base64.b64decode(url.split(",", 1)[1])
+            elif cache.exists():
                 raw = cache.read_bytes()
             else:
                 req = urllib.request.Request(url, headers=USER_AGENT)
@@ -1038,7 +1356,7 @@ class MealPlanner(tk.Tk):
         self.sync_running = False
         if error and getattr(error, "signed_out", False):
             self.sign_out()
-            self.notify("You've been signed out — click Family at the top to sign in again")
+            self.notify("This computer lost its family connection — ask the primary household member for an invite")
         elif error and "not in this family" in str(error):
             self.sync_cfg.pop("family", None)
             save_sync_config(self.sync_cfg)
@@ -1107,7 +1425,7 @@ class MealPlanner(tk.Tk):
         self.set_sync_status("off")
 
     def sync_dialog(self):
-        """The Family window: sign in -> join or start a family -> members and invites."""
+        """The Family window: set up (or join) a family -> members and QR invites. No emails anywhere."""
         win = tk.Toplevel(self, bg=CARD)
         win.title("Family")
         win.transient(self)
@@ -1151,52 +1469,48 @@ class MealPlanner(tk.Tk):
             tk.Label(frm, text="Family", bg=CARD, fg=TEXT, font=(F, 16, "bold")).pack(anchor="w")
             tk.Label(frm, text="Share one week plan, favorites and shopping list with your family.",
                      bg=CARD, fg=MUTED, font=(F, 9)).pack(anchor="w", pady=(0, 6))
-            session, family = self.sync_cfg.get("session"), self.sync_cfg.get("family")
+            family = self.sync_cfg.get("family")
             if not self.sb.configured:
                 tk.Label(frm, bg=CARD, fg=TEXT, font=(F, 10), justify="left", wraplength=420, text=(
                     "Family sharing isn't set up in this copy of the app yet.\n\n"
                     "Set it up by following \u201cSet up family sharing\u201d in README.md, then restart the app.")).pack(anchor="w")
-            elif not session and not state["email"]:
-                var, e = entry(frm, "Your email")
-                e.focus_set()
-                tk.Label(frm, text="No password needed \u2014 we'll email you a 6-digit code.", bg=CARD, fg=MUTED,
-                         font=(F, 9)).pack(anchor="w", pady=(4, 0))
-                button(frm, "Email me a code", lambda: run(lambda: self.sb.send_code(var.get()),
-                                                         lambda _: state.update(email=var.get().strip()))
-                       ).pack(anchor="w", pady=(12, 0))
-            elif not session:
-                tk.Label(frm, text=f"We sent a code to {state['email']}.", bg=CARD, fg=TEXT, font=(F, 10)).pack(anchor="w")
-                var, e = entry(frm, "Code", width=12, big=True)
-                e.focus_set()
-
-                def signed_in(sess):
-                    self.set_session(sess)
-                    state["email"] = None
-                    families = self.account.my_families()
-                    if families:
-                        self.after(0, lambda: enter_family(families[0], True))
-                row = tk.Frame(frm, bg=CARD)
-                row.pack(anchor="w", pady=(12, 0))
-                button(row, "Sign in", lambda: run(lambda: self.sb.verify_code(state["email"], var.get()),
-                                                   lambda sess: self.background(lambda: signed_in(sess), lambda *_: draw()))
-                       ).pack(side="left")
-                button(row, "Send a new code", lambda: run(lambda: self.sb.send_code(state["email"])), "ghost").pack(side="left", padx=8)
-                button(row, "Different email", lambda: (state.update(email=None), draw()), "ghost").pack(side="left")
             elif not family:
-                tk.Label(frm, text=f"Signed in as {session.get('email', '')}", bg=CARD, fg=MUTED, font=(F, 9)).pack(anchor="w")
-                tk.Label(frm, text="Join with an invite code", bg=CARD, fg=ACCENT_DARK, font=(F, 11, "bold")).pack(anchor="w", pady=(10, 0))
+                tk.Label(frm, text="Set up your family", bg=CARD, fg=ACCENT_DARK, font=(F, 11, "bold")).pack(anchor="w", pady=(6, 0))
+                tk.Label(frm, bg=CARD, fg=MUTED, font=(F, 9), justify="left", wraplength=420, text=(
+                    "This computer runs the family. Next, invite a phone with a QR code \u2014 the first phone "
+                    "to join becomes the primary household member and can invite everyone else. No emails or "
+                    "passwords.")).pack(anchor="w")
+                fam_name, fam_entry = entry(frm, "Family name")
+                fam_entry.focus_set()
+                name2, _ = entry(frm, "Family member name (you)")
+
+                def start():
+                    if not fam_name.get().strip() or not name2.get().strip():
+                        state["error"] = "Enter a family name and your family member name."
+                        return draw()
+
+                    def work():
+                        self.account.ensure_signed_in()
+                        return self.account.create_family(fam_name.get().strip(), name2.get().strip())
+                    run(work, lambda fam: enter_family(fam, False))
+                button(frm, "Set up family", start).pack(anchor="w", pady=(10, 0))
+                tk.Label(frm, text="Already have a family on another computer?", bg=CARD, fg=ACCENT_DARK,
+                         font=(F, 10, "bold")).pack(anchor="w", pady=(20, 0))
                 code, _ = entry(frm, "Invite code", width=14, big=True)
-                name, _ = entry(frm, "Your name")
-                button(frm, "Join family", lambda: run(lambda: self.account.join_family(code.get(), name.get()),
-                                                       lambda fam: enter_family(fam, True))).pack(anchor="w", pady=(10, 0))
-                tk.Label(frm, text="Or start a family", bg=CARD, fg=ACCENT_DARK, font=(F, 11, "bold")).pack(anchor="w", pady=(18, 0))
-                fam_name, _ = entry(frm, "Family name")
-                name2, _ = entry(frm, "Your name")
-                button(frm, "Start family", lambda: run(lambda: self.account.create_family(fam_name.get(), name2.get()),
-                                                        lambda fam: enter_family(fam, False)), "soft").pack(anchor="w", pady=(10, 0))
-                button(frm, "Sign out", lambda: (self.sign_out(), draw()), "ghost", small=True).pack(anchor="w", pady=(16, 0))
+                name, _ = entry(frm, "Family member name")
+
+                def join():
+                    if not name.get().strip():
+                        state["error"] = "Enter a family member name."
+                        return draw()
+
+                    def work():
+                        self.account.ensure_signed_in()
+                        return self.account.join_family(code.get(), name.get().strip())
+                    run(work, lambda fam: enter_family(fam, True))
+                button(frm, "Join family", join, "soft").pack(anchor="w", pady=(10, 0))
             else:
-                owner = family.get("role") == "owner"
+                manager = family.get("role") in ("owner", "primary")
                 tk.Label(frm, text=family["name"], bg=CARD, fg=TEXT, font=(F, 13, "bold")).pack(anchor="w", pady=(4, 0))
                 self.sync_status_label = tk.Label(frm, text=self.sync_status_text(), bg=CARD, font=(F, 9, "bold"),
                                                   fg=ACCENT_DARK if self.sync_state == "error" else GREEN,
@@ -1214,9 +1528,10 @@ class MealPlanner(tk.Tk):
                     row.pack(fill="x", pady=2)
                     label = (m.get("display_name") or "(no name)") + ("  (you)" if m.get("me") else "")
                     tk.Label(row, text=label, bg=CARD, fg=TEXT, font=(F, 10)).pack(side="left")
-                    if m.get("role") == "owner":
-                        tk.Label(row, text="Owner", bg=CARD, fg=ACCENT_DARK, font=(F, 9, "bold")).pack(side="left", padx=8)
-                    if owner and not m.get("me"):
+                    role = ROLE_LABELS.get(m.get("role"), "")
+                    if role:
+                        tk.Label(row, text=role, bg=CARD, fg=ACCENT_DARK, font=(F, 9, "bold")).pack(side="left", padx=8)
+                    if manager and not m.get("me") and m.get("role") != "owner":
                         x = tk.Label(row, text="Remove", bg=CARD, fg=MUTED, font=(F, 9, "underline"), cursor="hand2")
                         x.pack(side="right")
                         x.bind("<Button-1>", lambda e, uid=m["user_id"], who=m.get("display_name") or "this person":
@@ -1224,33 +1539,52 @@ class MealPlanner(tk.Tk):
                 if state["invite"]:
                     box = tk.Frame(frm, bg=ACCENT_SOFT, padx=14, pady=10)
                     box.pack(fill="x", pady=(12, 0))
-                    tk.Label(box, text="INVITE CODE", bg=ACCENT_SOFT, fg=ACCENT_DARK, font=(F, 8, "bold")).pack()
+                    link = web_app_url() + "#join=" + state["invite"] if web_app_url() else ""
+                    photo = qr_photo(link, 200) if link else None
+                    if photo:
+                        tk.Label(box, text="SCAN WITH A PHONE TO JOIN", bg=ACCENT_SOFT, fg=ACCENT_DARK,
+                                 font=(F, 8, "bold")).pack()
+                        img = tk.Label(box, image=photo, bg="white", bd=0)
+                        img.image = photo
+                        img.pack(pady=6)
+                        tk.Label(box, text="Point the phone's camera at the code and tap the link. The app opens "
+                                           "and asks for their family member name, then they're in.",
+                                 bg=ACCENT_SOFT, fg=MUTED, font=(F, 8), wraplength=380, justify="center").pack()
+                    tk.Label(box, text="INVITE CODE", bg=ACCENT_SOFT, fg=ACCENT_DARK, font=(F, 8, "bold")).pack(pady=(8, 0))
                     tk.Label(box, text=format_invite_code(state["invite"]), bg=ACCENT_SOFT, fg=TEXT,
                              font=(F, 22, "bold")).pack()
-                    tk.Label(box, text="Works for 7 days. They enter it on the app's Family tab after signing in.",
+                    tk.Label(box, text="Works for 7 days, for as many family members as you like.",
                              bg=ACCENT_SOFT, fg=MUTED, font=(F, 8)).pack()
 
                     def copy_invite():
+                        code_text = format_invite_code(state["invite"])
                         self.clipboard_clear()
-                        self.clipboard_append(f"Join our family on Meal Planner! Open the app, go to Family and enter "
-                                              f"this invite code: {format_invite_code(state['invite'])} (works for 7 days).")
+                        self.clipboard_append(
+                            "Join our family on Meal Planner! "
+                            + (f"Tap this link on your phone: {link}\n\nOr open" if link else "Open")
+                            + f" the app, go to Family and enter the invite code {code_text}. It works for 7 days.")
                         self.notify("Invite copied \u2014 paste it in a text or message")
                     button(box, "Copy invite message", copy_invite, "primary", small=True).pack(pady=(6, 0))
+                if not any(m.get("role") == "primary" for m in family.get("members", [])):
+                    tk.Label(frm, bg=CARD, fg=MUTED, font=(F, 9), justify="left", wraplength=420, text=(
+                        "Next: tap Invite someone and scan the QR code with a phone. The first phone to join "
+                        "becomes the primary household member, who can invite everyone else.")).pack(anchor="w", pady=(10, 0))
                 row = tk.Frame(frm, bg=CARD)
                 row.pack(anchor="w", pady=(12, 0))
-                button(row, "Invite someone", lambda: run(lambda: self.account.create_invite(family["family_id"]),
-                                                          lambda inv: state.update(invite=inv["code"]))).pack(side="left")
-                button(row, "Sync now", lambda: self.sync_now(then=lambda: win.winfo_exists() and draw()), "ghost").pack(side="left", padx=8)
+                if manager:
+                    button(row, "Invite someone", lambda: run(lambda: self.account.create_invite(family["family_id"]),
+                                                              lambda inv: state.update(invite=inv["code"]))).pack(side="left", padx=(0, 8))
+                button(row, "Sync now", lambda: self.sync_now(then=lambda: win.winfo_exists() and draw()), "ghost").pack(side="left")
                 row2 = tk.Frame(frm, bg=CARD)
                 row2.pack(anchor="w", pady=(14, 0))
 
                 def leave():
-                    if messagebox.askyesno("Leave family", "Leave this family? Your meals stay on this computer.", parent=win):
+                    warn = ("\n\nThis computer runs the family: the primary household member takes over, and this "
+                            "computer can only come back with a new invite." if family.get("role") == "owner" else "")
+                    if messagebox.askyesno("Leave family", "Leave this family? Your meals stay on this computer." + warn, parent=win):
                         run(lambda: self.account.leave_family(family["family_id"]),
                             lambda _: (self.sync_cfg.pop("family", None), save_sync_config(self.sync_cfg), self.set_sync_status("off")))
                 button(row2, "Leave family", leave, "ghost", small=True).pack(side="left")
-                button(row2, "Sign out", lambda: (self.sign_out(), draw()), "ghost", small=True).pack(side="left", padx=8)
-                tk.Label(frm, text=f"Signed in as {session.get('email', '')}", bg=CARD, fg=MUTED, font=(F, 8)).pack(anchor="w", pady=(8, 0))
             if state["error"]:
                 tk.Label(frm, text=state["error"], bg=CARD, fg=ACCENT_DARK, font=(F, 9, "bold"), wraplength=420,
                          justify="left").pack(anchor="w", pady=(10, 0))
@@ -2428,6 +2762,7 @@ class MealPlanner(tk.Tk):
         self.fav_title, actions = self.page_header(page, "Your favorites",
                                                    "Meals you know you love. These go into your weekly menu.")
         button(actions, "+  Add a meal", lambda: self.edit_favorite_dialog()).pack(side="right")
+        button(actions, "\u2913  Import from a website", self.import_recipe_dialog, "soft").pack(side="right", padx=(0, 8))
         self.fav_filter = tk.StringVar()
         entry = PlaceholderEntry(actions, "Filter favorites…", width=22)
         entry.pack(side="right", padx=8, ipady=5)
@@ -2541,56 +2876,202 @@ class MealPlanner(tk.Tk):
             del self.data["favorites"][idx]
             self.favorites_changed()
 
-    def edit_favorite_dialog(self, idx=None):
-        existing = self.data["favorites"][idx] if idx is not None else {}
+    def import_recipe_dialog(self):
+        """Paste a recipe link; the recipe is read from the page and opened in the editor to check."""
         win = tk.Toplevel(self, bg=CARD)
-        win.title("Edit meal" if idx is not None else "Add a meal")
+        win.title("Import a recipe")
         win.transient(self)
         win.resizable(False, False)
-        win.geometry(f"+{self.winfo_rootx() + 300}+{self.winfo_rooty() + 120}")
+        win.geometry(f"+{self.winfo_rootx() + 320}+{self.winfo_rooty() + 140}")
+        win.bind("<Escape>", lambda e: win.destroy())
         frm = tk.Frame(win, bg=CARD, padx=24, pady=20)
         frm.pack(fill="both", expand=True)
+        tk.Label(frm, text="Import a recipe", bg=CARD, fg=TEXT, font=(F, 15, "bold")).pack(anchor="w")
+        tk.Label(frm, text="Paste a link to a recipe page. The app reads the ingredients, steps and photo,\n"
+                           "and you can check everything before it's saved to Favorites.",
+                 bg=CARD, fg=MUTED, font=(F, 9), justify="left").pack(anchor="w", pady=(2, 10))
+        var = tk.StringVar()
+        entry = tk.Entry(frm, textvariable=var, width=60, relief="flat", font=(F, 10), bg=GHOST,
+                         highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
+        entry.pack(fill="x", ipady=5)
+        try:
+            clip = self.clipboard_get()
+            if normalize_url(clip) and len(clip) < 500:
+                var.set(clip.strip())  # a recipe link already copied? fill it in
+        except tk.TclError:
+            pass
+        status = tk.Label(frm, text="", bg=CARD, fg=ACCENT_DARK, font=(F, 9, "bold"), wraplength=460, justify="left")
+        row = tk.Frame(frm, bg=CARD)
+
+        def get():
+            url = normalize_url(var.get())
+            if not url:
+                return status.config(text="That doesn't look like a web address.")
+            status.config(text="Getting recipe\u2026", fg=MUTED)
+            for w in row.winfo_children():
+                w.destroy()
+
+            def work():
+                final, html = fetch_page(url)
+                return extract_recipe(html, final)
+
+            def done(recipe, error):
+                if not win.winfo_exists():
+                    return
+                if error or not recipe:
+                    status.config(fg=ACCENT_DARK, text=str(error) if error else
+                                  "That page doesn't include recipe details the app can read.")
+                    button(row, "Add it by hand instead", lambda: (
+                        win.destroy(), self.edit_favorite_dialog(draft={"url": url, "types": ["dinner"]})), "ghost",
+                        small=True).pack(side="left")
+                    return
+                win.destroy()
+                self.edit_favorite_dialog(draft=recipe)
+            self.background(work, done)
+
+        btns = tk.Frame(frm, bg=CARD)
+        btns.pack(anchor="w", pady=(10, 0))
+        button(btns, "Get recipe", get).pack(side="left")
+        button(btns, "Cancel", win.destroy, "ghost").pack(side="left", padx=8)
+        status.pack(anchor="w", pady=(10, 0))
+        row.pack(anchor="w", pady=(6, 0))
+        entry.bind("<Return>", lambda e: get())
+        entry.focus_set()
+        win.grab_set()
+
+    def edit_favorite_dialog(self, idx=None, draft=None):
+        """Add or edit a favorite, including its ingredients and steps. `draft` pre-fills an imported recipe."""
+        existing = self.data["favorites"][idx] if idx is not None else {}
+        if existing and self.needs_details(existing):  # saved before recipes were kept: fetch it to edit
+            return self.with_details([existing], lambda: self.edit_favorite_dialog(idx))
+        base = self.full_meal(existing) if existing else (draft or {})
+        win = tk.Toplevel(self, bg=CARD)
+        win.title("Edit meal" if existing else "Check the recipe" if draft else "Add a meal")
+        win.transient(self)
+        win.resizable(False, False)
+        win.geometry(f"+{self.winfo_rootx() + 280}+{self.winfo_rooty() + 30}")
+        frm = tk.Frame(win, bg=CARD, padx=24, pady=16)
+        frm.pack(fill="both", expand=True)
         tk.Label(frm, text=win.title(), bg=CARD, fg=TEXT, font=(F, 15, "bold")).grid(
-            row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+            row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
 
         def label(row, text):
             tk.Label(frm, text=text, bg=CARD, fg=TEXT, font=(F, 10, "bold")).grid(
-                row=row, column=0, sticky="nw", pady=6, padx=(0, 12))
+                row=row, column=0, sticky="nw", pady=5, padx=(0, 12))
 
         def entry(row, text, value):
             label(row, text)
             var = tk.StringVar(value=value)
-            e = tk.Entry(frm, textvariable=var, width=40, relief="flat", font=(F, 10), bg=GHOST,
+            e = tk.Entry(frm, textvariable=var, width=56, relief="flat", font=(F, 10), bg=GHOST,
                          highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
-            e.grid(row=row, column=1, pady=6, ipady=4, sticky="we")
+            e.grid(row=row, column=1, pady=5, ipady=4, sticky="we")
             return var, e
 
-        name_var, name_entry = entry(1, "Meal name", existing.get("name", ""))
+        def text_box(row, text, value, height, hint=""):
+            label(row, text)
+            box = tk.Frame(frm, bg=CARD)
+            box.grid(row=row, column=1, pady=5, sticky="we")
+            t = tk.Text(box, width=56, height=height, font=(F, 10), wrap="word", relief="flat", bg=GHOST,
+                        highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT, undo=True)
+            sb = ttk.Scrollbar(box, command=t.yview)
+            t.configure(yscrollcommand=sb.set)
+            t.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+            t.insert("1.0", value)
+            if hint:
+                tk.Label(frm, text=hint, bg=CARD, fg=MUTED, font=(F, 8)).grid(row=row + 1, column=1, sticky="w")
+            return t
+
+        name_var, name_entry = entry(1, "Meal name", base.get("name", ""))
         label(2, "Categories")
-        if existing:
-            start = meal_types(existing)
-        else:
-            start = {self.fav_tab if self.fav_tab != "all" else "dinner"}
+        start = meal_types(existing) if existing else set((draft or {}).get("types") or
+                                                           [self.fav_tab if self.fav_tab != "all" else "dinner"])
         type_vars = {}
         checks = tk.Frame(frm, bg=CARD)
-        checks.grid(row=2, column=1, sticky="w", pady=6)
+        checks.grid(row=2, column=1, sticky="w", pady=5)
         for key, text in TYPE_TAGS:
             type_vars[key] = tk.BooleanVar(value=key in start)
             tk.Checkbutton(checks, text=text, variable=type_vars[key], bg=CARD, activebackground=CARD,
                            font=(F, 10), cursor="hand2").pack(side="left", padx=(0, 10))
-        tk.Label(frm, text="Tick all that apply — the meal shows up under each tab", bg=CARD, fg=MUTED,
-                 font=(F, 8)).grid(row=3, column=1, sticky="w")
-        url_var, _ = entry(4, "Recipe link", existing.get("url", ""))
-        thumb_var, _ = entry(5, "Photo link", existing.get("thumb", ""))
-        tk.Label(frm, text="Optional — paste an image address to show a photo", bg=CARD, fg=MUTED,
-                 font=(F, 8)).grid(row=6, column=1, sticky="w")
-        label(7, "Notes")
-        notes = tk.Text(frm, width=40, height=4, font=(F, 10), wrap="word", relief="flat", bg=GHOST,
-                        highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
-        notes.insert("1.0", existing.get("notes", ""))
-        notes.grid(row=7, column=1, pady=6, sticky="we")
+        ingredients = text_box(3, "Ingredients", "\n".join(ingredient_lines(base)), 9,
+                               "One per line, e.g. \u201c2 cloves garlic\u201d \u2014 used for the shopping list")
+        steps = text_box(5, "Recipe steps", base.get("instructions", ""), 7)
+        url_var, _ = entry(6, "Recipe link", base.get("url", ""))
+        photo = {"thumb": base.get("thumb", ""), "busy": False}
+        label(7, "Photo")
+        photo_row = tk.Frame(frm, bg=CARD)
+        photo_row.grid(row=7, column=1, sticky="w", pady=5)
+        preview = tk.Label(photo_row, bg=CARD)
+        preview.pack(side="left")
+        photo_btns = tk.Frame(photo_row, bg=CARD)
+        photo_btns.pack(side="left", padx=12)
+        photo_msg = tk.Label(photo_btns, text="", bg=CARD, fg=MUTED, font=(F, 8), wraplength=260, justify="left")
+        thumb_var = tk.StringVar()
+
+        def show_photo():
+            thumb = photo["thumb"]
+            set_photo(self.images, preview, thumb, (120, 90), name_var.get() or "?")
+            remove_btn.pack_forget() if not thumb else remove_btn.pack(anchor="w", pady=(4, 0), after=choose_btn)
+            choose_btn.config(text="Change photo\u2026" if thumb else "Choose a photo\u2026")
+            thumb_var.set(thumb if thumb.startswith("http") else "")
+
+        def choose_photo():
+            path = filedialog.askopenfilename(parent=win, title="Choose a photo of the meal", filetypes=[
+                ("Photos", "*.jpg *.jpeg *.png *.webp *.gif *.bmp *.heic"), ("All files", "*.*")])
+            if not path:
+                return
+            online = self.sync_ready()
+            photo["busy"] = True
+            photo_msg.config(text="Saving photo\u2026" if online else "Adding photo\u2026", fg=MUTED)
+
+            def work():
+                jpeg = shrink_photo(path, PHOTO_MAX if online else PHOTO_LOCAL_MAX)
+                if not online:
+                    return "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
+                return self.account.upload_photo(self.sync_cfg["family"]["family_id"], jpeg)
+
+            def done(result, error):
+                photo["busy"] = False
+                if not win.winfo_exists():
+                    return
+                if error:
+                    msg = str(error) if isinstance(error, SyncError) else "Couldn\u2019t open that file as a photo."
+                    return photo_msg.config(text=msg, fg=ACCENT_DARK)
+                photo["thumb"] = result
+                photo_msg.config(text="")
+                show_photo()
+            self.background(work, done)
+
+        def remove_photo():
+            photo["thumb"] = ""
+            photo_msg.config(text="")
+            show_photo()
+
+        choose_btn = button(photo_btns, "", choose_photo, "ghost", small=True)
+        choose_btn.pack(anchor="w")
+        remove_btn = button(photo_btns, "Remove photo", remove_photo, "ghost", small=True)
+        photo_msg.pack(anchor="w", pady=(4, 0))
+        link_row = tk.Frame(photo_btns, bg=CARD)
+        link_row.pack(anchor="w", pady=(6, 0))
+        tk.Label(link_row, text="or paste a photo link:", bg=CARD, fg=MUTED, font=(F, 8)).pack(side="left")
+        link_entry = tk.Entry(link_row, textvariable=thumb_var, width=28, relief="flat", font=(F, 9), bg=GHOST,
+                              highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
+        link_entry.pack(side="left", padx=(6, 0), ipady=2)
+
+        def link_typed(*_):
+            typed = thumb_var.get().strip()
+            if typed != (photo["thumb"] if photo["thumb"].startswith("http") else ""):
+                photo["thumb"] = typed
+                set_photo(self.images, preview, typed, (120, 90), name_var.get() or "?")
+        link_entry.bind("<FocusOut>", link_typed)
+        link_entry.bind("<Return>", link_typed)
+        show_photo()
+        notes = text_box(9, "Notes", base.get("notes", ""), 2)
 
         def submit():
+            if photo["busy"]:
+                return messagebox.showinfo("Saving photo", "Wait a moment \u2014 the photo is still saving.", parent=win)
+            link_typed()
             name = name_var.get().strip()
             if not name:
                 messagebox.showwarning("Missing name", "Please give the meal a name.", parent=win)
@@ -2598,14 +3079,16 @@ class MealPlanner(tk.Tk):
             clash = any(f["name"].lower() == name.lower()
                         for i, f in enumerate(self.data["favorites"]) if i != idx)
             if clash:
-                return messagebox.showwarning("Already saved", f"“{name}” is already in Favorites.",
+                return messagebox.showwarning("Already saved", f"\u201c{name}\u201d is already in Favorites.",
                                               parent=win)
             types = [k for k, v in type_vars.items() if v.get()]
             if not types:
                 return messagebox.showwarning("Pick a category", "Tick at least one of Breakfast, Lunch, "
                                               "Dinner or Side.", parent=win)
-            meal = dict(existing, name=name, url=url_var.get().strip(),
-                        thumb=thumb_var.get().strip(), notes=notes.get("1.0", "end").strip(), types=types)
+            fields = dict(base, name=name, url=url_var.get().strip(), thumb=photo["thumb"],
+                          notes=notes.get("1.0", "end").strip(), types=types)
+            fields.pop("origin", None)
+            meal = apply_recipe_edits(fields, ingredients.get("1.0", "end"), steps.get("1.0", "end"))
             spot = next((i for i, f in enumerate(self.data["favorites"])
                          if existing and f.get("uid") == existing.get("uid")), None)
             if spot is None:
@@ -2613,14 +3096,14 @@ class MealPlanner(tk.Tk):
             else:
                 self.data["favorites"][spot] = meal
             self.favorites_changed()
-            self.notify(f"♥ Saved “{name}”")
+            self.notify(f"\u2665 Saved \u201c{name}\u201d")
             win.destroy()
 
         btns = tk.Frame(frm, bg=CARD)
-        btns.grid(row=8, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        btns.grid(row=11, column=0, columnspan=2, sticky="e", pady=(12, 0))
         button(btns, "Cancel", win.destroy, "ghost").pack(side="right")
-        button(btns, "Save meal", submit).pack(side="right", padx=8)
-        win.bind("<Return>", lambda e: None if e.widget is notes else submit())
+        button(btns, "Save to Favorites" if draft and not existing else "Save meal", submit).pack(side="right", padx=8)
+        win.bind("<Return>", lambda e: None if isinstance(e.widget, tk.Text) else submit())
         win.bind("<Escape>", lambda e: win.destroy())
         win.grab_set()
         name_entry.focus_set()
