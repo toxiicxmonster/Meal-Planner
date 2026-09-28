@@ -173,6 +173,12 @@ label.check input { width: 18px; height: 18px; accent-color: var(--accent); }
 .form label.field { display: grid; gap: 4px; font-weight: 700; font-size: 14px; }
 .form .note { font-weight: 400; color: var(--muted); font-size: 12px; }
 .form div.field { display: grid; gap: 6px; font-size: 14px; }
+.ing-list:empty { display: none; }
+.ing-list .item { padding: 4px 4px 4px 10px; gap: 6px; }
+.ing-list .item:first-child { border-top: 0; }
+.ing-list .ing-text { flex: 1; min-width: 0; border: 0; background: none; padding: 6px 0; font: inherit; font-size: 15px; color: var(--text); }
+.ing-add { display: flex; gap: 8px; }
+.ing-add input { flex: 1; min-width: 0; }
 .banner.invite .qr { display: block; width: 220px; max-width: 100%; margin: 8px auto 10px; border-radius: 8px; }
 .photo-pick { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .photo-pick img { width: 120px; height: 90px; object-fit: cover; border-radius: 10px; border: 1px solid var(--border); }

@@ -582,6 +582,10 @@
   }
 
   /** Add or edit a favorite. `draft` pre-fills a new one (an imported recipe). */
+  /** One ingredient in the meal editor: editable text plus a remove button. */
+  const ingredientRow = (line) => `<li class="item"><input type="text" class="ing-text" value="${esc(line)}" aria-label="Ingredient">
+    <button type="button" class="x ing-remove" aria-label="Remove ${esc(line)}">✕</button></li>`;
+
   function editorSheet(uid, draft) {
     const existing = uid ? favByUid(uid) : null;
     const base = existing || draft || {};
@@ -592,8 +596,10 @@
       <label class="field">Meal name<input type="text" name="name" required value="${esc(base.name || "")}"></label>
       <div class="field"><b>Categories</b> <span class="note">tick all that apply</span>
         <div class="checks">${MP.TYPE_TAGS.map(([k, l]) => `<label class="check"><input type="checkbox" name="type" value="${k}" ${start.has(k) ? "checked" : ""}> ${l}</label>`).join("")}</div></div>
-      <label class="field">Ingredients <span class="note">one per line, e.g. \u201c2 cloves garlic\u201d</span>
-        <textarea name="ingredients" rows="8">${esc(MP.ingredientLines(base).join("\n"))}</textarea></label>
+      <div class="field"><b>Ingredients</b> <span class="note">used for the shopping list</span>
+        <ul class="items ing-list" id="ing-list">${MP.ingredientLines(base).map(ingredientRow).join("")}</ul>
+        <div class="ing-add"><input type="text" id="ing-new" placeholder="Add an ingredient, e.g. 2 cloves garlic" enterkeyhint="done">
+          <button type="button" class="btn" id="ing-add-btn">Add</button></div></div>
       <label class="field">Recipe steps <span class="note">optional</span>
         <textarea name="instructions" rows="6">${esc(base.instructions || "")}</textarea></label>
       <label class="field">Recipe link <span class="note">optional</span><input type="url" name="url" value="${esc(base.url || "")}" placeholder="https://"></label>
@@ -606,6 +612,18 @@
       <label class="field">Notes<textarea name="notes" rows="2">${esc(base.notes || "")}</textarea></label>
       <div class="actions">${existing ? `<button type="button" class="btn" data-act="delete-fav" data-uid="${existing.uid}">Remove</button>` : ""}
         <button type="submit" class="btn primary">${draft ? "Save to Favorites" : "Save meal"}</button></div></form>`, (sheet) => {
+      const ingList = $("#ing-list", sheet), ingNew = $("#ing-new", sheet);
+      const addIngredient = () => {
+        const line = ingNew.value.trim();
+        if (!line) return;
+        ingList.insertAdjacentHTML("beforeend", ingredientRow(line));
+        ingNew.value = "";
+        ingNew.focus();
+      };
+      $("#ing-add-btn", sheet).addEventListener("click", addIngredient);
+      ingNew.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); addIngredient(); } });
+      ingList.addEventListener("click", (e) => { const x = e.target.closest(".ing-remove"); if (x) x.closest("li").remove(); });
+      ingList.addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target.matches(".ing-text")) { e.preventDefault(); ingNew.focus(); } });
       let photo = base.thumb || "", uploading = false;
       const preview = $("#photo-preview", sheet), status = $("#photo-status", sheet), link = $("#photo-url", sheet);
       const showPhoto = () => {
@@ -649,7 +667,10 @@
         const fields = Object.assign({}, base, { name, types, url: form.get("url").trim(), thumb: photo,
           notes: form.get("notes").trim() });
         delete fields.origin;
-        const meal = MP.applyRecipeEdits(fields, form.get("ingredients"), form.get("instructions"));
+        const lines = [...sheet.querySelectorAll(".ing-list input")].map((i) => i.value);
+        const pending = $("#ing-new", sheet).value.trim(); // typed but not added yet: keep it
+        if (pending) lines.push(pending);
+        const meal = MP.applyRecipeEdits(fields, lines.join("\n"), form.get("instructions"));
         const i = existing ? S.data.favorites.findIndex((f) => f.uid === existing.uid) : -1;
         if (i >= 0) S.data.favorites[i] = meal; else S.data.favorites.push(meal);
         save();

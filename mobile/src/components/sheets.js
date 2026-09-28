@@ -203,7 +203,7 @@ function EditorForm({ uid, draft, startType, onClose }) {
   const base = existing ? P.fullMeal(existing) : draft || {};
   const [name, setName] = useState(base.name || "");
   const [types, setTypes] = useState(() => [...(existing ? MP.mealTypes(existing) : new Set(draft && draft.types ? draft.types : [startType || "dinner"]))]);
-  const [ingredients, setIngredients] = useState(() => MP.ingredientLines(base).join("\n"));
+  const [ingredients, setIngredients] = useState(() => MP.ingredientLines(base));
   const [instructions, setInstructions] = useState(base.instructions || "");
   const [url, setUrl] = useState(base.url || "");
   const [thumb, setThumb] = useState(base.thumb || "");
@@ -225,9 +225,8 @@ function EditorForm({ uid, draft, startType, onClose }) {
           </Pressable>
         ))}
       </View>
-      <Text style={s.label}>Ingredients {hint("(one per line, e.g. “2 cloves garlic”)")}</Text>
-      <TextInput style={[s.input, { minHeight: 160, textAlignVertical: "top" }]} value={ingredients} onChangeText={setIngredients}
-        multiline placeholder={"2 cloves garlic\n1 lb ground beef"} placeholderTextColor={C.muted} autoCapitalize="none" />
+      <Text style={s.label}>Ingredients {hint("(used for the shopping list)")}</Text>
+      <IngredientList lines={ingredients} onChange={setIngredients} />
       <Text style={s.label}>Recipe steps {hint("(optional)")}</Text>
       <TextInput style={[s.input, { minHeight: 140, textAlignVertical: "top" }]} value={instructions} onChangeText={setInstructions} multiline />
       <Text style={s.label}>Recipe link {hint("(optional)")}</Text>
@@ -240,9 +239,43 @@ function EditorForm({ uid, draft, startType, onClose }) {
       <View style={[s.row, { marginTop: 18 }]}>
         {existing ? <Button title="Remove" icon="trash-outline" kind="danger" onPress={() => { P.removeFavorite(uid); onClose(); }} /> : null}
         <Button title={photoBusy ? "Saving photo…" : draft ? "Save to Favorites" : "Save meal"} kind="primary" flex disabled={photoBusy} onPress={() => {
-          const err = P.saveFavorite({ name, types, url, thumb, notes, ingredients, instructions }, uid, existing ? P.fullMeal(existing) : draft);
+          const err = P.saveFavorite({ name, types, url, thumb, notes, ingredients: ingredients.join("\n"), instructions }, uid, existing ? P.fullMeal(existing) : draft);
           if (err) setError(err); else onClose();
         }} />
+      </View>
+    </View>
+  );
+}
+
+/** Ingredients one per row: edit a row's text, remove it with ✕, or add a new one at the bottom. */
+function IngredientList({ lines, onChange }) {
+  const [draft, setDraft] = useState("");
+  const add = () => {
+    const line = draft.trim();
+    if (!line) return;
+    onChange(lines.concat(line));
+    setDraft("");
+  };
+  return (
+    <View>
+      {lines.length ? (
+        <View style={{ borderWidth: 1, borderColor: C.border, borderRadius: 12, backgroundColor: C.card, marginBottom: 8 }}>
+          {lines.map((line, i) => (
+            <View key={i} style={{ flexDirection: "row", alignItems: "center", paddingLeft: 12, borderTopWidth: i ? 1 : 0, borderTopColor: C.border }}>
+              <TextInput style={[s.body, { flex: 1, paddingVertical: 10 }]} value={line} accessibilityLabel="Ingredient"
+                onChangeText={(t) => onChange(lines.map((x, j) => (j === i ? t : x)))} />
+              <Pressable hitSlop={8} accessibilityLabel={`Remove ${line}`} style={{ padding: 10 }}
+                onPress={() => { tap(); onChange(lines.filter((_, j) => j !== i)); }}>
+                <Ionicons name="close-circle" size={20} color={C.ghostDark} />
+              </Pressable>
+            </View>
+          ))}
+        </View>
+      ) : null}
+      <View style={s.row}>
+        <TextInput style={[s.input, { flex: 1 }]} value={draft} onChangeText={setDraft} placeholder="Add an ingredient, e.g. 2 cloves garlic"
+          placeholderTextColor={C.muted} autoCapitalize="none" returnKeyType="done" submitBehavior="submit" onSubmitEditing={add} />
+        <Button title="Add" icon="add" disabled={!draft.trim()} onPress={add} />
       </View>
     </View>
   );

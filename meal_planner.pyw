@@ -58,10 +58,11 @@ API = "https://www.themealdb.com/api/json/v1/1/"
 DAYS = ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]  # weeks run Sat-Fri
 SOURCES = [("favorites", "Favorites only"), ("mix", "Mix of both"), ("explore", "Explore only")]
 MEAL_TYPES = [("all", "All"), ("breakfast", "Breakfast"), ("lunch", "Lunch"), ("dinner", "Dinner"),
-              ("dessert", "Dessert"), ("sides", "Sides")]
+              ("appetizer", "Appetizers"), ("dessert", "Dessert"), ("sides", "Sides")]
 FAV_TABS = [("all", "All"), ("dinner", "Dinner"), ("lunch", "Lunch"), ("breakfast", "Breakfast"),
-            ("sides", "Sides")]
-TYPE_TAGS = [("breakfast", "Breakfast"), ("lunch", "Lunch"), ("dinner", "Dinner"), ("sides", "Side")]
+            ("appetizer", "Appetizers"), ("sides", "Sides")]
+TYPE_TAGS = [("breakfast", "Breakfast"), ("lunch", "Lunch"), ("dinner", "Dinner"), ("appetizer", "Appetizer"),
+             ("sides", "Side")]
 PROTEINS = [("seafood", "Seafood"), ("poultry", "Poultry"), ("beef", "Beef"), ("pork", "Pork"),
             ("lamb", "Lamb"), ("vegetarian", "Vegetarian")]
 
@@ -570,7 +571,8 @@ LUNCH_WORDS = word_re(["soup", "salad", "sandwich", "wrap", "burger", "slider", 
 
 
 TYPE_WORDS = {"breakfast": "breakfast", "lunch": "lunch", "dinner": "dinner", "side": "sides", "sides": "sides",
-              "dessert": "dessert"}
+              "dessert": "dessert", "appetizer": "appetizer", "appetizers": "appetizer", "starter": "appetizer",
+              "starters": "appetizer"}
 
 
 def meal_types(m):
@@ -586,8 +588,8 @@ def meal_types(m):
         return {"breakfast"}
     if cat == "Side":
         return {"sides"}
-    if cat in ("Starter", "Soup", "Salad"):
-        return {"lunch", "dinner"} if cat != "Starter" else {"lunch"}
+    if cat in ("Soup", "Salad"):
+        return {"lunch", "dinner"}
     types = {"dinner"}
     if cat in ("Pasta", "Miscellaneous", "Vegetarian", "Vegan") or LUNCH_WORDS.search(name):
         types.add("lunch")
@@ -830,6 +832,7 @@ def instruction_lines(node, out, depth=0):
 
 GUESS = [("breakfast", re.compile(r"(^|[^a-z0-9_])(breakfast|brunch)(?![a-z0-9_])", re.I)),
          ("sides", re.compile(r"(^|[^a-z0-9_])(sides?|side dish)(?![a-z0-9_])", re.I)),
+         ("appetizer", re.compile(r"(^|[^a-z0-9_])(appetizers?|starters?|hors d'oeuvres?|finger foods?)(?![a-z0-9_])", re.I)),
          ("lunch", re.compile(r"(^|[^a-z0-9_])(lunch|sandwich|salad|soup)(?![a-z0-9_])", re.I))]
 
 
@@ -2993,8 +2996,72 @@ class MealPlanner(tk.Tk):
             type_vars[key] = tk.BooleanVar(value=key in start)
             tk.Checkbutton(checks, text=text, variable=type_vars[key], bg=CARD, activebackground=CARD,
                            font=(F, 10), cursor="hand2").pack(side="left", padx=(0, 10))
-        ingredients = text_box(3, "Ingredients", "\n".join(ingredient_lines(base)), 9,
-                               "One per line, e.g. \u201c2 cloves garlic\u201d \u2014 used for the shopping list")
+        # Ingredients: a list with Add / Remove (double-click one to change it); used for the shopping list.
+        label(3, "Ingredients")
+        ing_box = tk.Frame(frm, bg=CARD)
+        ing_box.grid(row=3, column=1, pady=5, sticky="we")
+        ing_list = tk.Listbox(ing_box, height=8, font=(F, 10), relief="flat", bg=GHOST, activestyle="none",
+                              highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT,
+                              selectbackground=ACCENT_SOFT, selectforeground=TEXT)
+        ing_scroll = ttk.Scrollbar(ing_box, command=ing_list.yview)
+        ing_list.configure(yscrollcommand=ing_scroll.set)
+        ing_list.pack(side="left", fill="both", expand=True)
+        ing_scroll.pack(side="right", fill="y")
+        for line in ingredient_lines(base):
+            ing_list.insert("end", line)
+        ing_bottom = tk.Frame(frm, bg=CARD)
+        ing_bottom.grid(row=4, column=1, sticky="we")
+        ing_row = tk.Frame(ing_bottom, bg=CARD)
+        ing_row.pack(fill="x")
+        ing_var = tk.StringVar()
+        ing_entry = tk.Entry(ing_row, textvariable=ing_var, relief="flat", font=(F, 10), bg=GHOST,
+                             highlightthickness=1, highlightbackground=BORDER, highlightcolor=ACCENT)
+        ing_entry.pack(side="left", fill="x", expand=True, ipady=3)
+        ing_editing = {"index": None}  # the row being changed, after a double-click
+
+        def add_ingredient(_=None):
+            line = ing_var.get().strip()
+            if not line:
+                return "break"
+            if ing_editing["index"] is None:
+                ing_list.insert("end", line)
+                ing_list.see("end")
+            else:
+                i = ing_editing["index"]
+                ing_list.delete(i)
+                ing_list.insert(i, line)
+                ing_editing["index"] = None
+                add_btn.config(text="Add")
+            ing_var.set("")
+            ing_entry.focus_set()
+            return "break"
+
+        def remove_ingredient(_=None):
+            for i in reversed(ing_list.curselection()):
+                ing_list.delete(i)
+            if ing_editing["index"] is not None:
+                ing_editing["index"] = None
+                add_btn.config(text="Add")
+                ing_var.set("")
+
+        def edit_ingredient(_=None):
+            sel = ing_list.curselection()
+            if sel:
+                ing_editing["index"] = sel[0]
+                ing_var.set(ing_list.get(sel[0]))
+                add_btn.config(text="Update")
+                ing_entry.focus_set()
+                ing_entry.icursor("end")
+
+        add_btn = button(ing_row, "Add", add_ingredient, "soft", small=True)
+        add_btn.pack(side="left", padx=(6, 0))
+        button(ing_row, "Remove", remove_ingredient, "ghost", small=True).pack(side="left", padx=(6, 0))
+        ing_entry.bind("<Return>", add_ingredient)
+        ing_list.bind("<Double-Button-1>", edit_ingredient)
+        ing_list.bind("<Delete>", remove_ingredient)
+        ing_list.bind("<BackSpace>", remove_ingredient)
+        tk.Label(frm, text="Type one and click Add (e.g. \u201c2 cloves garlic\u201d). Double-click one to change it. "
+                 "Used for the shopping list.", bg=CARD, fg=MUTED, font=(F, 8)).pack(in_=ing_bottom, anchor="w")
         steps = text_box(5, "Recipe steps", base.get("instructions", ""), 7)
         url_var, _ = entry(6, "Recipe link", base.get("url", ""))
         photo = {"thumb": base.get("thumb", ""), "busy": False}
@@ -3088,7 +3155,10 @@ class MealPlanner(tk.Tk):
             fields = dict(base, name=name, url=url_var.get().strip(), thumb=photo["thumb"],
                           notes=notes.get("1.0", "end").strip(), types=types)
             fields.pop("origin", None)
-            meal = apply_recipe_edits(fields, ingredients.get("1.0", "end"), steps.get("1.0", "end"))
+            lines = list(ing_list.get(0, "end"))
+            if ing_var.get().strip() and ing_editing["index"] is None:  # typed but not added yet: keep it
+                lines.append(ing_var.get().strip())
+            meal = apply_recipe_edits(fields, "\n".join(lines), steps.get("1.0", "end"))
             spot = next((i for i, f in enumerate(self.data["favorites"])
                          if existing and f.get("uid") == existing.get("uid")), None)
             if spot is None:

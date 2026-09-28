@@ -1,5 +1,5 @@
 /* Offline support: the app itself and recipe photos are cached; family sync (Supabase) and TheMealDB data calls always use the network. */
-const VERSION = "meal-planner-v7";
+const VERSION = "meal-planner-v8";
 const PHOTOS = "meal-planner-photos";
 const SHELL = ["./", "index.html", "style.css", "config.js", "core.js", "vendor/qrcode.js", "app.js", "manifest.webmanifest",
   "icons/icon-192.png", "icons/icon-512.png", "icons/apple-touch-icon.png"];

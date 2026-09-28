@@ -20,9 +20,9 @@ Recipes and photos come from [TheMealDB](https://www.themealdb.com), a free reci
   - See **Last week**, or start planning **Next week** early.
   - **Send** the menu by text, Messenger or email.
 - **Explore**: browse TheMealDB's recipes (about 790), loaded live each time you open the app. Filter by meal type and by cuisine or region, leave out seafood, poultry, beef, pork, lamb or vegetarian dishes, and search by dish or ingredient.
-- **Favorites**: your own meals in Dinner, Lunch, Breakfast and Sides tabs. A meal can be in more than one.
+- **Favorites**: your own meals in Dinner, Lunch, Breakfast, Appetizers and Sides tabs. A meal can be in more than one.
   - **Import** a recipe from a website by pasting its link: the name, photo, ingredients and steps come in for you to check.
-  - **Edit** any meal's ingredients and recipe steps.
+  - **Edit** any meal's ingredient list (add or remove one at a time) and recipe steps.
   - **Add a photo** straight from your phone's camera or photo library, or from a file on the computer.
 - **Shopping list**: add ingredients from any recipe or the whole week, grouped by store aisle, with duplicates combined ("Onion — 2 + 1" for Tacos and Chili). Check items off as they go in the cart.
 - **Family**: the desktop app sets up the family and shows a QR code. The first phone to scan it becomes the **primary household member**, who can invite everyone else with their own QR code. No emails or passwords.
@@ -136,9 +136,9 @@ The **desktop app** is the family's "brain": it sets up the family. Do this on t
 **Favorites.**
 - Tap **Save** on any recipe, or **+** to add your own meal.
 - **Import** a recipe from a website: tap **Import** (desktop: **⤓ Import from a website**) and paste the recipe's link. Check what came in, fix anything, and save.
-- **Edit** a meal to change its ingredients (one per line; they feed the shopping list) and recipe steps.
+- **Edit** a meal to add or remove ingredients one at a time (they feed the shopping list; tap or double-click one to change it) and to change the recipe steps.
 - **Photos:** in the meal editor, tap **Take photo** or **Choose photo** (desktop: **Choose a photo…**). Photos are shrunk before saving. In a family they're stored online so everyone sees them; otherwise they're kept inside the meal. You can still paste a photo link instead.
-- Tap a meal's **Breakfast / Lunch / Dinner / Side** tags to sort it. Only meals tagged **Dinner** are used when shuffling the week.
+- Tap a meal's **Breakfast / Lunch / Dinner / Appetizer / Side** tags to sort it. Only meals tagged **Dinner** are used when shuffling the week.
 
 **New weeks.** Every Saturday, the current plan moves to **Last week** and a fresh menu is made. To plan early, use **Next week**.
 

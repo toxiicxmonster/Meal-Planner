@@ -8,10 +8,11 @@
   const DAYS = ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]; // weeks run Sat-Fri
   const SOURCES = [["favorites", "Favorites only"], ["mix", "Mix of both"], ["explore", "Explore only"]];
   const MEAL_TYPES = [["all", "All"], ["breakfast", "Breakfast"], ["lunch", "Lunch"], ["dinner", "Dinner"],
-    ["dessert", "Dessert"], ["sides", "Sides"]];
+    ["appetizer", "Appetizers"], ["dessert", "Dessert"], ["sides", "Sides"]];
   const FAV_TABS = [["all", "All"], ["dinner", "Dinner"], ["lunch", "Lunch"], ["breakfast", "Breakfast"],
-    ["sides", "Sides"]];
-  const TYPE_TAGS = [["breakfast", "Breakfast"], ["lunch", "Lunch"], ["dinner", "Dinner"], ["sides", "Side"]];
+    ["appetizer", "Appetizers"], ["sides", "Sides"]];
+  const TYPE_TAGS = [["breakfast", "Breakfast"], ["lunch", "Lunch"], ["dinner", "Dinner"], ["appetizer", "Appetizer"],
+    ["sides", "Side"]];
   const PROTEINS = [["seafood", "Seafood"], ["poultry", "Poultry"], ["beef", "Beef"], ["pork", "Pork"],
     ["lamb", "Lamb"], ["vegetarian", "Vegetarian"]];
   const ALL_CUISINES = "All cuisines";
@@ -57,7 +58,7 @@
     "burrito", "toastie", "panini", "bagel", "pizza", "grilled cheese", "cheesesteak", "dip", "sub",
     "stromboli", "chowder"]);
   const TYPE_WORDS = { breakfast: "breakfast", lunch: "lunch", dinner: "dinner", side: "sides", sides: "sides",
-    dessert: "dessert" };
+    dessert: "dessert", appetizer: "appetizer", appetizers: "appetizer", starter: "appetizer", starters: "appetizer" };
 
   function mealTypes(m) {
     if (m.types && m.types.length) return new Set(m.types);
@@ -67,7 +68,6 @@
     if (cat === "Dessert") return new Set(["dessert"]);
     if (cat === "Breakfast") return new Set(["breakfast"]);
     if (cat === "Side") return new Set(["sides"]);
-    if (cat === "Starter") return new Set(["lunch"]);
     if (cat === "Soup" || cat === "Salad") return new Set(["lunch", "dinner"]);
     const types = new Set(["dinner"]);
     if (["Pasta", "Miscellaneous", "Vegetarian", "Vegan"].includes(cat) || LUNCH_WORDS.test(m.name)) types.add("lunch");
@@ -356,6 +356,7 @@
   }
 
   const GUESS = [["breakfast", /(^|[^a-z0-9_])(breakfast|brunch)(?![a-z0-9_])/i], ["sides", /(^|[^a-z0-9_])(sides?|side dish)(?![a-z0-9_])/i],
+    ["appetizer", /(^|[^a-z0-9_])(appetizers?|starters?|hors d'oeuvres?|finger foods?)(?![a-z0-9_])/i],
     ["lunch", /(^|[^a-z0-9_])(lunch|sandwich|salad|soup)(?![a-z0-9_])/i]];
 
   /** Categories for an imported recipe, from what the site calls it. Dinner unless it says otherwise. */
