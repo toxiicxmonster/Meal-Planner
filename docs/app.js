@@ -444,6 +444,28 @@
 
   // ---- shopping list
 
+  /** Pick the aisle for a list item; the choice is remembered for that item from then on. */
+  function aisleSheet(uid) {
+    const it = S.data.shopping.find((x) => x.uid === uid);
+    if (!it) return;
+    const now = it.aisle || "Other";
+    openSheet(sheetHead(`Which aisle is “${esc(it.name)}” in?`) +
+      `<p class="sub">The list remembers this, so ${esc(it.name.toLowerCase())} goes there every time.</p>
+      <form class="add-item aisle-type" id="aisle-form"><input type="text" name="aisle" maxlength="30" placeholder="Type an aisle, e.g. A21 or Outdoors"
+          value="${MP.AISLES.includes(now) ? "" : esc(now)}" autocomplete="off" enterkeyhint="done">
+        <button class="btn primary" type="submit">Use</button></form>
+      <div class="aisle-picks">${MP.aisleChoices(S.data).map((a) => `<button class="btn${a === now ? " primary" : ""}" data-act="set-aisle" data-uid="${esc(uid)}" data-aisle="${esc(a)}">${a === now ? "✓ " : ""}${esc(a)}</button>`).join("")}</div>`, (sheet) => {
+      $("#aisle-form", sheet).addEventListener("submit", (e) => {
+        e.preventDefault();
+        const typed = MP.cleanAisle(new FormData(e.target).get("aisle"), S.data);
+        if (!typed) return;
+        MP.setAisle(S.data, uid, typed);
+        save(); closeSheet(); render();
+        toast(`Moved to ${typed} — it’ll go there from now on`);
+      });
+    });
+  }
+
   function renderShopping() {
     const list = S.data.shopping;
     const toBuy = list.filter((it) => !it.checked), done = list.filter((it) => it.checked);
@@ -456,12 +478,17 @@
     }
     const row = (it) => `<li class="item ${it.checked ? "done" : ""}">
       <button class="tick" data-act="tick" data-uid="${it.uid}" aria-label="${it.checked ? "Uncheck" : "Check off"} ${esc(it.name)}">${it.checked ? "\u2713" : ""}</button>
-      <div class="item-text" data-act="tick" data-uid="${it.uid}"><div class="item-name">${esc(it.name)}${it.qty ? ` <span class="item-qty">\u2014 ${esc(it.qty)}</span>` : ""}</div>
-      ${it.meals && it.meals.length ? `<div class="item-for">for ${esc(it.meals.join(", "))}</div>` : ""}</div>
-      <button class="x" data-act="remove-item" data-uid="${it.uid}" aria-label="Remove ${esc(it.name)}">\u2715</button></li>`;
-    for (const aisle of MP.AISLES) {
+      <div class="item-text" data-act="tick" data-uid="${it.uid}"><div class="item-name">${esc(it.name)}${it.checked && it.qty ? ` <span class="item-qty">\u2014 ${esc(it.qty)}</span>` : ""}</div>
+      <div class="item-sub">${it.meals && it.meals.length ? `<span class="item-for">for ${esc(it.meals.join(", "))}</span>` : ""}
+        ${it.checked ? "" : `<button class="aisle-chip${(it.aisle || "Other") === "Other" ? " pick" : ""}" data-act="item-aisle" data-uid="${it.uid}">${(it.aisle || "Other") === "Other" ? "Choose aisle" : "Move"} ▾</button>`}</div></div>
+      ${it.checked ? "" : `<div class="qty-step" role="group" aria-label="How many ${esc(it.name)}">
+        <button data-act="qty-down" data-uid="${it.uid}" aria-label="Less ${esc(it.name)}">−</button>
+        <span class="qty-val${it.qty ? "" : " none"}">${esc(it.qty || "1")}</span>
+        <button data-act="qty-up" data-uid="${it.uid}" aria-label="More ${esc(it.name)}">+</button></div>`}
+      <button class="x del" title="Remove from list" data-act="remove-item" data-uid="${it.uid}" aria-label="Remove ${esc(it.name)}">✕</button></li>`;
+    for (const aisle of MP.listAisles(toBuy)) {
       const items = toBuy.filter((it) => (it.aisle || "Other") === aisle).sort((a, b) => a.name.localeCompare(b.name));
-      if (items.length) html += `<div class="aisle">${esc(aisle)}</div><ul class="items">${items.map(row).join("")}</ul>`;
+      if (items.length) html += `<div class="aisle">${esc(MP.aisleLabel(aisle))}</div><ul class="items">${items.map(row).join("")}</ul>`;
     }
     if (done.length) {
       html += `<div class="aisle row" style="justify-content:space-between"><span>In cart</span>
@@ -486,7 +513,7 @@
     const adds = [...container.querySelectorAll("input.ing:checked")].map((c) =>
       ({ name: c.dataset.name, qty: c.dataset.qty, meal: c.dataset.meal }));
     if (!adds.length) return toast("Tick the ingredients you need");
-    const { added, combined } = MP.addToList(S.data.shopping, adds);
+    const { added, combined } = MP.addToList(S.data.shopping, adds, S.data.aisles);
     save();
     closeSheet();
     render();
@@ -992,6 +1019,19 @@
         if (it) { it.checked = !it.checked; save(); render(); }
         break;
       }
+      case "item-aisle": aisleSheet(el.dataset.uid); break;
+      case "set-aisle":
+        MP.setAisle(d, el.dataset.uid, el.dataset.aisle);
+        save(); closeSheet(); render();
+        toast(`Moved to ${el.dataset.aisle} — it’ll go there from now on`);
+        break;
+      case "qty-up":
+      case "qty-down": {
+        const it = d.shopping.find((x) => x.uid === el.dataset.uid);
+        const next = it && MP.stepQty(it.qty || "", act === "qty-up" ? 1 : -1);
+        if (it && next !== (it.qty || "")) { it.qty = next; save(); render(); }
+        break;
+      }
       case "remove-item": d.shopping = d.shopping.filter((x) => x.uid !== el.dataset.uid); save(); render(); break;
       case "clear-checked": d.shopping = d.shopping.filter((x) => !x.checked); save(); render(); break;
       case "sync-now": syncNow().then(() => familySheet()); break;
@@ -1054,7 +1094,7 @@
     const input = e.target.querySelector("input");  // not .elements.item: every form has a built-in item() function
     const { name, qty } = MP.parseQuickItem(input.value);
     if (!name) return;
-    MP.addToList(S.data.shopping, [{ name, qty }]);
+    MP.addToList(S.data.shopping, [{ name, qty }], S.data.aisles);
     save();
     render();
     const again = $("#add-item input");

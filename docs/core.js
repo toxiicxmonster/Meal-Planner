@@ -30,7 +30,7 @@
     "Oceanian": ["Australian"],
   };
   const PLAN_KEYS = ["week_start", "week", "kept", "sides"];
-  const SETTINGS_KEYS = ["source", "filters"];
+  const SETTINGS_KEYS = ["source", "filters", "aisles"]; // aisles: {ingredient key: aisle} the family picked
   const SLIM_KEYS = ["id", "uid", "name", "thumb", "category", "area", "types", "origin", "url", "youtube", "notes"];
 
   // ------------------------------------------------------------ meal types & proteins
@@ -202,13 +202,73 @@
       "coconut", "watercress", "rocket", "arugula", "sweetcorn"]],
   ].map(([aisle, words]) => [aisle, wordRe(words)]);
   // Shown in the order you walk a store (the rules above are checked in a different order).
-  const AISLES = ["Produce", "Meat & Seafood", "Dairy & Eggs", "Bakery", "Pantry", "Spices & Seasonings", "Frozen", "Other"];
+  const AISLES = ["Produce", "Meat & Seafood", "Dairy & Eggs", "Bakery", "Pantry", "Spices & Seasonings", "Frozen", "Household",
+    "Other"];
   const SKIP_INGREDIENTS = new Set(["water", "cold water", "hot water", "boiling water", "warm water", "ice"]);
 
-  function aisleOf(name) {
+  /** Which aisle an item is in: the family's own choice for it (`custom`), else the built-in rules. */
+  function aisleOf(name, custom) {
+    const mine = custom && custom[ingredientKey(name)];
+    if (mine && typeof mine === "string" && mine.trim()) return mine.trim();
     for (const [aisle, rx] of AISLE_RULES) if (rx.test(name)) return aisle;
     return "Other";
   }
+
+  /**
+   * An aisle name the family typed, tidied: a built-in or already-used name typed in another case becomes that
+   * name ("produce" -> "Produce"); anything else is kept as typed ("A21", "Outdoors"). "" if blank.
+   */
+  function cleanAisle(text, data) {
+    const t = String(text || "").replace(/\s+/g, " ").trim().slice(0, 30);
+    if (!t) return "";
+    const known = AISLES.concat(Object.values((data && data.aisles) || {}));
+    return known.find((a) => a.toLowerCase() === t.toLowerCase()) || t;
+  }
+
+  /** Put a list item in an aisle (built-in or typed), and remember it so that item sorts there from now on. */
+  function setAisle(data, uid, aisle) {
+    const item = data.shopping.find((it) => it.uid === uid);
+    const name = cleanAisle(aisle, data);
+    if (!item || !name) return;
+    const key = ingredientKey(item.name);
+    data.aisles = Object.assign({}, data.aisles, { [key]: name });
+    for (const it of data.shopping) if (ingredientKey(it.name) === key) it.aisle = name;
+  }
+
+  /** Sort key that puts "A2" before "A10": [text, number, text, ...], lower-case. */
+  function naturalKey(s) {
+    return String(s).toLowerCase().split(/([0-9]+)/).filter((p, i) => p !== "" || i === 0)
+      .map((p) => (/^[0-9]+$/.test(p) ? Number(p) : p));
+  }
+  function naturalCompare(a, b) {
+    const x = naturalKey(a), y = naturalKey(b);
+    for (let i = 0; i < Math.max(x.length, y.length); i++) {
+      if (i >= x.length) return -1;
+      if (i >= y.length) return 1;
+      const p = x[i], q = y[i];
+      if (p === q) continue;
+      if (typeof p === "number" && typeof q === "number") return p - q;
+      if (typeof p === "number") return -1;
+      if (typeof q === "number") return 1;
+      return p < q ? -1 : 1;
+    }
+    return 0;
+  }
+
+  /** The list's sections in order: the built-in aisles in store order, then the family's own (A2 before A10), then "Other". */
+  function listAisles(items) {
+    const own = [...new Set(items.map((it) => it.aisle || "Other"))].filter((a) => !AISLES.includes(a)).sort(naturalCompare);
+    return AISLES.filter((a) => a !== "Other").concat(own, ["Other"]);
+  }
+
+  /** Aisles to offer in the picker: the built-in ones (not "Other"), then the ones the family has typed before. */
+  function aisleChoices(data) {
+    const own = [...new Set(Object.values((data && data.aisles) || {}))].filter((a) => !AISLES.includes(a)).sort(naturalCompare);
+    return AISLES.filter((a) => a !== "Other").concat(own);
+  }
+
+  /** How an aisle is shown: "Other" is shown as "Not sorted". */
+  const aisleLabel = (a) => (!a || a === "Other" ? "Not sorted" : a);
 
   /** "Onions " and "onion" are the same item on the list. */
   function ingredientKey(name) {
@@ -227,8 +287,88 @@
     return (meal.ingredients || []).map((line) => ({ q: "", n: line }));
   }
 
+  // ---- quantities on the list: "2 cups" + "1 cup" = "3 cups", and the list's - / + buttons.
+  // Must match parse_qty() etc. in meal_planner.pyw.
+  const FRACTION_CHARS = { "\u00bc": 1 / 4, "\u00bd": 1 / 2, "\u00be": 3 / 4, "\u2153": 1 / 3, "\u2154": 2 / 3,
+    "\u215b": 1 / 8, "\u215c": 3 / 8, "\u215d": 5 / 8, "\u215e": 7 / 8 };
+  const FRAC = "[\u00bc\u00bd\u00be\u2153\u2154\u215b\u215c\u215d\u215e]";
+  const QTY_RE = new RegExp("^\\s*([0-9]+/[0-9]+|[0-9]+(?:\\.[0-9]+)?(?:\\s*" + FRAC + "|\\s+[0-9]+/[0-9]+)?|" + FRAC + ")\\s*(.*)$");
+  // Unit words that change with the amount: 1 cup, 2 cups.
+  const UNIT_PLURALS = { cup: "cups", clove: "cloves", can: "cans", tin: "tins", pack: "packs", package: "packages",
+    packet: "packets", bag: "bags", bunch: "bunches", slice: "slices", piece: "pieces", stick: "sticks", head: "heads",
+    sprig: "sprigs", pound: "pounds", ounce: "ounces", lb: "lbs", jar: "jars", bottle: "bottles", box: "boxes",
+    tablespoon: "tablespoons", teaspoon: "teaspoons", pinch: "pinches", dash: "dashes", handful: "handfuls",
+    stalk: "stalks", fillet: "fillets", loaf: "loaves", carton: "cartons", dozen: "dozen", gram: "grams", liter: "liters" };
+  const UNIT_SINGULARS = Object.fromEntries(Object.entries(UNIT_PLURALS).map(([s, p]) => [p, s]));
+
+  /** "1 1/2 cups" -> {n: 1.5, unit: "cups"}; null when it doesn't start with a plain amount (e.g. "2-3", "a pinch"). */
+  function parseQty(text) {
+    const m = String(text || "").match(QTY_RE);
+    if (!m || /^(-|\u2013|to )/i.test(m[2])) return null;
+    let n = 0;
+    for (const bit of m[1].replace(new RegExp("(" + FRAC + ")", "g"), " $1").trim().split(/\s+/)) {
+      if (bit in FRACTION_CHARS) n += FRACTION_CHARS[bit];
+      else if (bit.includes("/")) { const [a, b] = bit.split("/").map(Number); if (!b) return null; n += a / b; }
+      else n += Number(bit);
+    }
+    return { n, unit: m[2].trim() };
+  }
+
+  /** 1.5 -> "1\u00bd", 0.25 -> "\u00bc", 3 -> "3", 0.3 -> "0.3". */
+  function formatAmount(n) {
+    const whole = Math.floor(n + 1e-9), rest = n - whole;
+    if (rest < 0.01) return String(whole);
+    for (const [ch, v] of Object.entries(FRACTION_CHARS)) {
+      if (Math.abs(rest - v) < 0.01) return (whole ? String(whole) : "") + ch;
+    }
+    return String(Math.round(n * 100) / 100);
+  }
+
+  /** The unit with its first word made singular or plural to suit the amount. */
+  function fitUnit(unit, n) {
+    const m = unit.match(/^([A-Za-z]+)(.*)$/);
+    if (!m) return unit;
+    const word = m[1].toLowerCase(), single = UNIT_SINGULARS[word] || (word in UNIT_PLURALS ? word : null);
+    if (!single) return unit;
+    return (n > 1 ? UNIT_PLURALS[single] : single) + m[2];
+  }
+
+  const unitKey = (unit) => { const f = fitUnit(unit, 1).toLowerCase(); return f.replace(/\s+/g, " "); };
+  const showQty = (n, unit) => formatAmount(n) + (unit ? " " + fitUnit(unit, n) : "");
+
+  /** Add up the parts of a quantity that share a unit: "2 + 1" -> "3", "2 cups + 1 tbsp + 1 cup" -> "3 cups + 1 tbsp". */
+  function tidyQty(qty) {
+    const out = [];
+    for (const part of String(qty || "").split(" + ").map((p) => p.trim()).filter(Boolean)) {
+      const q = parseQty(part);
+      const same = q && out.find((o) => o.q && unitKey(o.q.unit) === unitKey(q.unit));
+      if (same) same.q = { n: same.q.n + q.n, unit: same.q.unit };
+      else out.push({ q, text: part });
+    }
+    return out.map((o) => (o.q ? showQty(o.q.n, o.q.unit) : o.text)).join(" + ");
+  }
+
+  /** Two quantities of the same item together. */
+  const combineQty = (a, b) => tidyQty(a && b ? a + " + " + b : a || b || "");
+
+  /**
+   * The list's - / + buttons: change the amount by `delta` (1 or -1), keeping the unit. It never goes to
+   * zero (removing is the \u2715 button). No amount counts as 1; an amount that isn't a number gets a count ("2 \u00d7 a pinch").
+   */
+  function stepQty(qty, delta) {
+    const parts = tidyQty(qty).split(" + ").filter(Boolean);
+    if (!parts.length) return delta > 0 ? String(1 + delta) : "";
+    let q = parseQty(parts[0]);
+    if (q && /^(g|grams?|ml|milliliters?)$/i.test(q.unit)) q = null; // "200 g" steps as packs: 2 × 200 g
+    if (!q) q ={ n: 1, unit: "\u00d7 " + parts[0] };
+    const n = q.n + delta;
+    if (n <= 0) return parts.join(" + ");
+    parts[0] = n === 1 && q.unit.startsWith("\u00d7 ") ? q.unit.slice(2) : showQty(n, q.unit);
+    return parts.join(" + ");
+  }
+
   /** Add ingredients to the list, combining with items still to buy. adds = [{name, qty, meal}]. */
-  function addToList(list, adds) {
+  function addToList(list, adds, customAisles) {
     let added = 0, combined = 0;
     for (const a of adds) {
       const name = a.name.trim();
@@ -236,11 +376,11 @@
       const key = ingredientKey(name);
       const hit = list.find((it) => !it.checked && ingredientKey(it.name) === key);
       if (hit) {
-        if (a.qty) hit.qty = hit.qty ? hit.qty + " + " + a.qty : a.qty;
+        if (a.qty) hit.qty = combineQty(hit.qty, a.qty);
         if (a.meal && !hit.meals.includes(a.meal)) hit.meals = hit.meals.concat(a.meal);
         combined++;
       } else {
-        const item = { name: name.charAt(0).toUpperCase() + name.slice(1), qty: a.qty || "", aisle: aisleOf(name),
+        const item = { name: name.charAt(0).toUpperCase() + name.slice(1), qty: a.qty || "", aisle: aisleOf(name, customAisles),
           checked: false, meals: a.meal ? [a.meal] : [] };
         list.push(item);
         added++;
@@ -471,6 +611,7 @@
     d.plan_updated = d.plan_updated || 0;
     d.shopping = d.shopping || [];
     d.settings_updated = d.settings_updated || 0;
+    d.aisles = d.aisles || {};
     return d;
   }
 
@@ -801,7 +942,8 @@
     API, DAYS, SOURCES, MEAL_TYPES, FAV_TABS, TYPE_TAGS, PROTEINS, ALL_CUISINES, AREA_FIX, REGIONS,
     PLAN_KEYS, SETTINGS_KEYS, mealTypes, proteins, parseMeal, CATEGORIES, fetchIndex, fetchDetails, searchIngredient, thumbUrl, isoDate, parseIso,
     addDays, weekStartOf, shortDate, dateRange, clone, normalizeData, slimMeal, canonical, stamp, mergeData,
-    shuffled, pickAvoiding, weekText, AISLES, aisleOf, ingredientKey, mealParts, addToList, parseQuickItem, cleanText, parseIngredientLine, formatDuration, extractRecipe, normalizeUrl, ingredientLines, applyRecipeEdits, SyncError, Supabase, FamilyAccount, FamilyStore, formatInviteCode, ROLE_LABELS, canManage, qrSvgPath, sleep,
+    shuffled, pickAvoiding, weekText, AISLES, aisleOf, setAisle, cleanAisle, listAisles, aisleChoices, aisleLabel, naturalCompare, ingredientKey, mealParts, addToList, parseQuickItem,
+    parseQty, formatAmount, tidyQty, combineQty, stepQty, cleanText, parseIngredientLine, formatDuration, extractRecipe, normalizeUrl, ingredientLines, applyRecipeEdits, SyncError, Supabase, FamilyAccount, FamilyStore, formatInviteCode, ROLE_LABELS, canManage, qrSvgPath, sleep,
     PHOTO_MAX, PHOTO_LOCAL_MAX, PHOTO_QUALITY, photoSize, photoPath, base64ToBytes,
   };
   if (typeof module !== "undefined" && module.exports) module.exports = MP;

@@ -354,7 +354,7 @@ function createPlanner() {
   // ------------------------------------------------------------ shopping list
 
   function addIngredients(adds) {
-    const r = MP.addToList(S.data.shopping, adds);
+    const r = MP.addToList(S.data.shopping, adds, S.data.aisles);
     save();
     notify(`Added ${r.added} item${r.added === 1 ? "" : "s"} to your list` + (r.combined ? `, ${r.combined} combined with items already on it` : ""));
     return r;
@@ -362,12 +362,24 @@ function createPlanner() {
   function quickAdd(text) {
     const { name, qty } = MP.parseQuickItem(text);
     if (!name) return;
-    MP.addToList(S.data.shopping, [{ name, qty }]);
+    MP.addToList(S.data.shopping, [{ name, qty }], S.data.aisles);
     save();
   }
   function toggleItem(uid) {
     const it = S.data.shopping.find((x) => x.uid === uid);
     if (it) { it.checked = !it.checked; save(); }
+  }
+  /** The list's - / + buttons: change how much of an item to buy (never down to zero). */
+  function stepItem(uid, delta) {
+    const it = S.data.shopping.find((x) => x.uid === uid);
+    const next = it && MP.stepQty(it.qty || "", delta);
+    if (it && next !== (it.qty || "")) { it.qty = next; save(); }
+  }
+  /** Put a list item in another aisle; the list remembers it for that item from then on. */
+  function setItemAisle(uid, aisle) {
+    MP.setAisle(S.data, uid, aisle);
+    save();
+    notify(`Moved to ${aisle} — it’ll go there from now on`);
   }
   function removeItem(uid) { S.data.shopping = S.data.shopping.filter((x) => x.uid !== uid); save(); }
   function clearChecked() { S.data.shopping = S.data.shopping.filter((x) => !x.checked); save(); }
@@ -597,7 +609,7 @@ function createPlanner() {
     ensureCatalog, reloadCatalog, searchIngredient, shuffleWeek, swapDay, randomSide, removeSide, toggleKeep, setSource, pickFavorite, startNextWeek,
     addFavorite, saveFavorite, removeFavorite, toggleFavType,
     setType, setCuisine, toggleLeaveOut, reshuffleExplore, exploreVisible, cuisineOptions, cuisineLabel,
-    addIngredients, quickAdd, toggleItem, removeItem, clearChecked, plannedMeals,
+    addIngredients, quickAdd, toggleItem, stepItem, setItemAisle, removeItem, clearChecked, plannedMeals,
     familyConfigured: sb.configured, joinWithInvite, inviteLink, refreshFamily, createInvite,
     importRecipe, setPendingImport, takePendingImport, savePhoto,
     removeMember, setDisplayName, leaveFamily, signOut, syncNow,

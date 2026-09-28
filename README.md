@@ -24,7 +24,7 @@ Recipes and photos come from [TheMealDB](https://www.themealdb.com), a free reci
   - **Import** a recipe from a website by pasting its link: the name, photo, ingredients and steps come in for you to check.
   - **Edit** any meal's ingredient list (add or remove one at a time) and recipe steps.
   - **Add a photo** straight from your phone's camera or photo library, or from a file on the computer.
-- **Shopping list**: add ingredients from any recipe or the whole week, grouped by store aisle, with duplicates combined ("Onion — 2 + 1" for Tacos and Chili). Check items off as they go in the cart.
+- **Shopping list**: add ingredients from any recipe or the whole week, grouped by store aisle, with duplicates combined (Onion 2 for Tacos + 1 for Chili = **3**). Change how much to buy with **−** / **+**, remove single items, and put anything in your own aisle (like **A21** or **Outdoors**) — the list remembers it. Check items off as they go in the cart.
 - **Family**: the desktop app sets up the family and shows a QR code. The first phone to scan it becomes the **primary household member**, who can invite everyone else with their own QR code. No emails or passwords.
 
 ---
@@ -132,6 +132,8 @@ The **desktop app** is the family's "brain": it sets up the family. Do this on t
 **Shopping.**
 - Tap the **cart** button on This Week to add the whole week's ingredients, or open any recipe and add its ingredients from there. Untick anything you already have.
 - On the **List** tab, type extra items ("2 lemons"), tap items to check them off, and **Clear** the ones in the cart when you're done.
+- **−** / **+** change how much of an item to buy ("2 cups" → "3 cups"; "200 g" → "2 × 200 g"). **−** never removes an item; **✕** removes just that one item.
+- **Choose aisle** (or **Move**) puts an item in another aisle. Pick one of the store sections, or type your own — a store's aisle number like **A21**, or a section like **Outdoors**. The list remembers it for that item, for everyone in the family. Items the app can't place go under **Not sorted**.
 
 **Favorites.**
 - Tap **Save** on any recipe, or **+** to add your own meal.

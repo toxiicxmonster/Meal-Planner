@@ -33,7 +33,7 @@ import os
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageTk
@@ -86,7 +86,7 @@ SYNC_FILE = HERE / "sync_config.json"
 SUPABASE_CONFIG = HERE / "supabase" / "config.json"
 SYNC_EVERY_MS = 60_000
 PLAN_KEYS = ("week_start", "week", "kept", "sides")
-SETTINGS_KEYS = ("source", "filters")
+SETTINGS_KEYS = ("source", "filters", "aisles")  # aisles: {ingredient key: aisle} the family picked
 SLIM_KEYS = ("id", "uid", "name", "thumb", "category", "area", "types", "origin", "url", "youtube", "notes")
 PHONE_LINK_APP = r"shell:AppsFolder\Microsoft.YourPhone_8wekyb3d8bbwe!App"
 USER_AGENT = {"User-Agent": "Mozilla/5.0 (MealPlanner)"}
@@ -155,6 +155,7 @@ def load_data():
     data.setdefault("plan_updated", 0)
     data.setdefault("shopping", [])
     data.setdefault("settings_updated", 0)
+    data.setdefault("aisles", {})
     return data
 
 
@@ -650,12 +651,62 @@ AISLE_RULES = [(aisle, word_re(words)) for aisle, words in [
                  "watercress", "rocket", "arugula", "sweetcorn"]),
 ]]
 # Shown in the order you walk a store (the rules above are checked in a different order).
-AISLES = ["Produce", "Meat & Seafood", "Dairy & Eggs", "Bakery", "Pantry", "Spices & Seasonings", "Frozen", "Other"]
+AISLES = ["Produce", "Meat & Seafood", "Dairy & Eggs", "Bakery", "Pantry", "Spices & Seasonings", "Frozen", "Household",
+          "Other"]
 SKIP_INGREDIENTS = {"water", "cold water", "hot water", "boiling water", "warm water", "ice"}
 
 
-def aisle_of(name):
+def aisle_of(name, custom=None):
+    """Which aisle an item is in: the family's own choice for it (custom), else the built-in rules."""
+    mine = (custom or {}).get(ingredient_key(name))
+    if isinstance(mine, str) and mine.strip():
+        return mine.strip()
     return next((aisle for aisle, rx in AISLE_RULES if rx.search(name)), "Other")
+
+
+def clean_aisle(text, data=None):
+    """An aisle name the family typed, tidied (same as cleanAisle in core.js): "produce" -> "Produce", "A21" stays."""
+    t = " ".join(str(text or "").split())[:30]
+    if not t:
+        return ""
+    known = AISLES + list(((data or {}).get("aisles") or {}).values())
+    return next((a for a in known if a.lower() == t.lower()), t)
+
+
+def set_aisle(data, uid, aisle):
+    """Put a list item in an aisle (built-in or typed), and remember it so that item sorts there from now on."""
+    item = next((it for it in data["shopping"] if it.get("uid") == uid), None)
+    name = clean_aisle(aisle, data)
+    if not item or not name:
+        return
+    key = ingredient_key(item["name"])
+    data["aisles"] = dict(data.get("aisles") or {}, **{key: name})
+    for it in data["shopping"]:
+        if ingredient_key(it["name"]) == key:
+            it["aisle"] = name
+
+
+def natural_key(s):
+    """Sort key that puts "A2" before "A10" (same order as naturalCompare in core.js)."""
+    parts = [p for i, p in enumerate(re.split(r"([0-9]+)", str(s).lower())) if p != "" or i == 0]
+    return [(0, int(p), "") if p.isdigit() else (1, 0, p) for p in parts]
+
+
+def list_aisles(items):
+    """The list's sections in order: built-in aisles, then the family's own (A2 before A10), then "Other"."""
+    own = sorted({it.get("aisle") or "Other" for it in items} - set(AISLES), key=natural_key)
+    return [a for a in AISLES if a != "Other"] + own + ["Other"]
+
+
+def aisle_choices(data):
+    """Aisles to offer in the picker: the built-in ones (not "Other"), then the ones the family has typed before."""
+    own = sorted(set(((data or {}).get("aisles") or {}).values()) - set(AISLES), key=natural_key)
+    return [a for a in AISLES if a != "Other"] + own
+
+
+def aisle_label(a):
+    """How an aisle is shown: "Other" is shown as "Not sorted"."""
+    return "Not sorted" if not a or a == "Other" else a
 
 
 def ingredient_key(name):
@@ -691,7 +742,112 @@ def meal_parts(meal, by_id):
     return [{"q": "", "n": line} for line in meal.get("ingredients", [])]
 
 
-def add_to_list(items, adds):
+# ---- quantities on the list: "2 cups" + "1 cup" = "3 cups", and the list's - / + buttons (same as core.js).
+FRACTION_CHARS = {"\u00bc": 1 / 4, "\u00bd": 1 / 2, "\u00be": 3 / 4, "\u2153": 1 / 3, "\u2154": 2 / 3,
+                  "\u215b": 1 / 8, "\u215c": 3 / 8, "\u215d": 5 / 8, "\u215e": 7 / 8}
+FRAC = "[\u00bc\u00bd\u00be\u2153\u2154\u215b\u215c\u215d\u215e]"
+QTY_RE = re.compile(r"^\s*([0-9]+/[0-9]+|[0-9]+(?:\.[0-9]+)?(?:\s*" + FRAC + r"|\s+[0-9]+/[0-9]+)?|" + FRAC + r")\s*(.*)$",
+                    re.S)
+UNIT_PLURALS = {"cup": "cups", "clove": "cloves", "can": "cans", "tin": "tins", "pack": "packs", "package": "packages",
+                "packet": "packets", "bag": "bags", "bunch": "bunches", "slice": "slices", "piece": "pieces",
+                "stick": "sticks", "head": "heads", "sprig": "sprigs", "pound": "pounds", "ounce": "ounces", "lb": "lbs",
+                "jar": "jars", "bottle": "bottles", "box": "boxes", "tablespoon": "tablespoons", "teaspoon": "teaspoons",
+                "pinch": "pinches", "dash": "dashes", "handful": "handfuls", "stalk": "stalks", "fillet": "fillets",
+                "loaf": "loaves", "carton": "cartons", "dozen": "dozen", "gram": "grams", "liter": "liters"}
+UNIT_SINGULARS = {p: s for s, p in UNIT_PLURALS.items()}
+
+
+def parse_qty(text):
+    """"1 1/2 cups" -> (1.5, "cups"); None when it doesn't start with a plain amount (e.g. "2-3", "a pinch")."""
+    m = QTY_RE.match(str(text or ""))
+    if not m or re.match(r"(-|\u2013|to )", m.group(2), re.I):
+        return None
+    n = 0
+    for bit in re.sub("(" + FRAC + ")", r" \1", m.group(1)).split():
+        if bit in FRACTION_CHARS:
+            n += FRACTION_CHARS[bit]
+        elif "/" in bit:
+            a, b = bit.split("/")
+            if not int(b):
+                return None
+            n += int(a) / int(b)
+        else:
+            n += float(bit)
+    return n, m.group(2).strip()
+
+
+def js_number(x):
+    """How JavaScript's String() shows a number: 3 -> "3", 2.5 -> "2.5"."""
+    return str(int(x)) if float(x).is_integer() else repr(float(x))
+
+
+def format_amount(n):
+    """1.5 -> "1\u00bd", 0.25 -> "\u00bc", 3 -> "3", 0.3 -> "0.3"."""
+    whole = int((n + 1e-9) // 1)
+    rest = n - whole
+    if rest < 0.01:
+        return str(whole)
+    for ch, v in FRACTION_CHARS.items():
+        if abs(rest - v) < 0.01:
+            return (str(whole) if whole else "") + ch
+    return js_number(round_half_up(n * 100) / 100)
+
+
+def fit_unit(unit, n):
+    """The unit with its first word made singular or plural to suit the amount."""
+    m = re.match(r"^([A-Za-z]+)(.*)$", unit, re.S)
+    if not m:
+        return unit
+    word = m.group(1).lower()
+    single = UNIT_SINGULARS.get(word) or (word if word in UNIT_PLURALS else None)
+    if not single:
+        return unit
+    return (UNIT_PLURALS[single] if n > 1 else single) + m.group(2)
+
+
+def unit_key(unit):
+    return re.sub(r"\s+", " ", fit_unit(unit, 1).lower())
+
+
+def show_qty(n, unit):
+    return format_amount(n) + (" " + fit_unit(unit, n) if unit else "")
+
+
+def tidy_qty(qty):
+    """Add up the parts of a quantity that share a unit: "2 + 1" -> "3", "2 cups + 1 tbsp + 1 cup" -> "3 cups + 1 tbsp"."""
+    out = []
+    for part in [p.strip() for p in str(qty or "").split(" + ") if p.strip()]:
+        q = parse_qty(part)
+        same = next((o for o in out if o[0] and q and unit_key(o[0][1]) == unit_key(q[1])), None) if q else None
+        if same:
+            same[0] = (same[0][0] + q[0], same[0][1])
+        else:
+            out.append([q, part])
+    return " + ".join(show_qty(*o[0]) if o[0] else o[1] for o in out)
+
+
+def combine_qty(a, b):
+    """Two quantities of the same item together."""
+    return tidy_qty(a + " + " + b if a and b else a or b or "")
+
+
+def step_qty(qty, delta):
+    """The list's - / + buttons: change the amount by delta, keeping the unit; never down to zero (same as core.js)."""
+    parts = [p for p in tidy_qty(qty).split(" + ") if p]
+    if not parts:
+        return str(1 + delta) if delta > 0 else ""
+    q = parse_qty(parts[0])
+    if q and re.fullmatch(r"g|grams?|ml|milliliters?", q[1], re.I):  # "200 g" steps as packs: 2 \u00d7 200 g
+        q = None
+    q = q or (1, "\u00d7 " + parts[0])
+    n = q[0] + delta
+    if n <= 0:
+        return " + ".join(parts)
+    parts[0] = q[1][2:] if n == 1 and q[1].startswith("\u00d7 ") else show_qty(n, q[1])
+    return " + ".join(parts)
+
+
+def add_to_list(items, adds, custom_aisles=None):
     """Add ingredients to the list, combining with items still to buy. adds = [{name, qty, meal}]."""
     added = combined = 0
     for a in adds:
@@ -702,12 +858,12 @@ def add_to_list(items, adds):
         hit = next((it for it in items if not it["checked"] and ingredient_key(it["name"]) == key), None)
         if hit:
             if a.get("qty"):
-                hit["qty"] = hit["qty"] + " + " + a["qty"] if hit["qty"] else a["qty"]
+                hit["qty"] = combine_qty(hit["qty"], a["qty"])
             if a.get("meal") and a["meal"] not in hit["meals"]:
                 hit["meals"] = hit["meals"] + [a["meal"]]
             combined += 1
         else:
-            items.append({"name": name[:1].upper() + name[1:], "qty": a.get("qty") or "", "aisle": aisle_of(name),
+            items.append({"name": name[:1].upper() + name[1:], "qty": a.get("qty") or "", "aisle": aisle_of(name, custom_aisles),
                           "checked": False, "meals": [a["meal"]] if a.get("meal") else []})
             added += 1
     return added, combined
@@ -2575,7 +2731,7 @@ class MealPlanner(tk.Tk):
         qty, name = parse_quick_item(self.item_entry.get())
         if not name:
             return self.item_entry.focus_set()
-        add_to_list(self.data["shopping"], [{"name": name, "qty": qty}])
+        add_to_list(self.data["shopping"], [{"name": name, "qty": qty}], self.data.get("aisles"))
         self.item_entry.delete(0, "end")
         self.shopping_changed()
 
@@ -2588,6 +2744,48 @@ class MealPlanner(tk.Tk):
             if it["uid"] == uid:
                 it["checked"] = not it["checked"]
         self.shopping_changed()
+
+    def step_item(self, uid, delta):
+        """The list's - / + buttons: change how much of an item to buy (never down to zero)."""
+        it = next((x for x in self.data["shopping"] if x["uid"] == uid), None)
+        new = it and step_qty(it.get("qty") or "", delta)
+        if it and new != (it.get("qty") or ""):
+            it["qty"] = new
+            self.shopping_changed()
+
+    def aisle_menu(self, uid, widget):
+        """Pick the aisle for a list item; the list remembers it for that item from then on."""
+        it = next((x for x in self.data["shopping"] if x["uid"] == uid), None)
+        if not it:
+            return
+        menu = tk.Menu(self, tearoff=False, font=(F, 10))
+        menu.add_command(label=f"Which aisle is “{it['name']}” in?", state="disabled")
+        menu.add_separator()
+        for aisle in aisle_choices(self.data):
+            now = (it.get("aisle") or "Other") == aisle
+            menu.add_command(label=("✓  " if now else "     ") + aisle,
+                             command=lambda a=aisle: self.set_item_aisle(uid, a))
+        menu.add_separator()
+        menu.add_command(label="     Type an aisle…  (e.g. A21 or Outdoors)", command=lambda: self.type_aisle(uid))
+        menu.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height())
+
+    def type_aisle(self, uid):
+        """Name the aisle yourself: a store's aisle number ("A21") or a section ("Outdoors")."""
+        it = next((x for x in self.data["shopping"] if x["uid"] == uid), None)
+        if not it:
+            return
+        now = it.get("aisle") or "Other"
+        typed = simpledialog.askstring("Aisle", f"Which aisle is “{it['name']}” in?\n"
+                                       "Type a store aisle like A21, or a section like Outdoors.",
+                                       initialvalue="" if now in AISLES else now, parent=self)
+        name = clean_aisle(typed, self.data)
+        if name:
+            self.set_item_aisle(uid, name)
+
+    def set_item_aisle(self, uid, aisle):
+        set_aisle(self.data, uid, aisle)
+        self.shopping_changed()
+        self.notify(f"Moved to {aisle} — it’ll go there from now on")
 
     def remove_item(self, uid):
         self.data["shopping"] = [it for it in self.data["shopping"] if it["uid"] != uid]
@@ -2608,11 +2806,11 @@ class MealPlanner(tk.Tk):
         grid = self.pages["shopping"].cards
         cards = []
         groups = [(aisle, sorted((it for it in to_buy if (it.get("aisle") or "Other") == aisle),
-                                 key=lambda it: it["name"].lower())) for aisle in AISLES]
+                                 key=lambda it: it["name"].lower())) for aisle in list_aisles(to_buy)]
         groups = [(a, g) for a, g in groups if g] + ([("In cart", done)] if done else [])
         for aisle, group in groups:
             card = tk.Frame(grid.inner, bg=CARD, highlightthickness=1, highlightbackground=BORDER, padx=12, pady=10)
-            tk.Label(card, text=aisle.upper(), bg=CARD, fg=ACCENT_DARK if aisle != "In cart" else MUTED,
+            tk.Label(card, text=aisle_label(aisle).upper(), bg=CARD, fg=ACCENT_DARK if aisle != "In cart" else MUTED,
                      font=(F, 9, "bold"), anchor="w").pack(fill="x", pady=(0, 4))
             for it in group:
                 row = tk.Frame(card, bg=CARD)
@@ -2622,18 +2820,43 @@ class MealPlanner(tk.Tk):
                                command=lambda u=it["uid"]: self.toggle_item(u)).pack(side="left", anchor="n")
                 text = tk.Frame(row, bg=CARD)
                 text.pack(side="left", fill="x", expand=True)
-                label = it["name"] + (f"  \u2014 {it['qty']}" if it.get("qty") else "")
+                label = it["name"] + (f"  \u2014 {it['qty']}" if it.get("qty") and it["checked"] else "")
                 name = tk.Label(text, text=label, bg=CARD, fg=MUTED if it["checked"] else TEXT, anchor="w",
-                                justify="left", wraplength=250, cursor="hand2",
+                                justify="left", wraplength=150 if not it["checked"] else 250, cursor="hand2",
                                 font=(F, 10, "overstrike") if it["checked"] else (F, 10, "bold"))
                 name.pack(fill="x")
                 name.bind("<Button-1>", lambda e, u=it["uid"]: self.toggle_item(u))
                 if it.get("meals"):
                     tk.Label(text, text="for " + ", ".join(it["meals"]), bg=CARD, fg=MUTED, font=(F, 8),
                              anchor="w", justify="left", wraplength=250).pack(fill="x")
-                x = tk.Label(row, text="\u2715", bg=CARD, fg=MUTED, cursor="hand2", font=(F, 9))
+                x = tk.Label(row, text="\u2715", bg=CARD, fg=MUTED, cursor="hand2", font=(F, 10), padx=5)
                 x.pack(side="right", anchor="n", padx=(6, 0))
                 x.bind("<Button-1>", lambda e, u=it["uid"]: self.remove_item(u))
+                x.bind("<Enter>", lambda e, w=x: w.config(bg=ACCENT_SOFT, fg=ACCENT_DARK))
+                x.bind("<Leave>", lambda e, w=x: w.config(bg=CARD, fg=MUTED))
+                Tooltip(x, f"Remove {it['name']} from the list")
+                if not it["checked"]:
+                    # how much to buy, as one pill: [ - amount + ]
+                    pill = tk.Frame(row, bg=GHOST, padx=2, pady=1)
+                    pill.pack(side="right", anchor="n")
+                    for text_, delta in (("\u2212", -1), ("QTY", 0), ("+", 1)):
+                        if delta:
+                            b = tk.Label(pill, text=text_, bg=GHOST, fg=TEXT, cursor="hand2", font=(F, 11, "bold"), width=2)
+                            b.bind("<Button-1>", lambda e, u=it["uid"], d=delta: self.step_item(u, d))
+                            b.bind("<Enter>", lambda e, w=b: w.config(bg=CARD))
+                            b.bind("<Leave>", lambda e, w=b: w.config(bg=GHOST))
+                            Tooltip(b, ("More " if delta > 0 else "Less ") + it["name"])
+                        else:
+                            b = tk.Label(pill, text=it.get("qty") or "1", bg=GHOST, fg=TEXT if it.get("qty") else MUTED,
+                                         font=(F, 10, "bold" if it.get("qty") else "normal"), wraplength=90, justify="center")
+                        b.pack(side="left")
+                    # the aisle: pick one when it didn't sort itself, or move it
+                    other = (it.get("aisle") or "Other") == "Other"
+                    move = tk.Label(text, text="Choose aisle \u25be" if other else "Move \u25be", cursor="hand2",
+                                    bg=ACCENT_SOFT if other else CARD, fg=ACCENT_DARK if other else MUTED,
+                                    font=(F, 8, "bold"), padx=6 if other else 0)
+                    move.pack(anchor="w", pady=(2, 0))
+                    move.bind("<Button-1>", lambda e, u=it["uid"], w=move: self.aisle_menu(u, w))
             cards.append(card)
         grid.set_cards(cards, "Your shopping list is empty.\nClick \u201cAdd this week's ingredients\u201d, "
                               "or open any recipe and add its ingredients.")
@@ -2696,7 +2919,7 @@ class MealPlanner(tk.Tk):
             adds = [a for v, a in checks if v.get()]
             if not adds:
                 return self.notify("Tick the ingredients you need")
-            added, combined = add_to_list(self.data["shopping"], adds)
+            added, combined = add_to_list(self.data["shopping"], adds, self.data.get("aisles"))
             self.shopping_changed()
             win.destroy()
             self.notify(f"Added {added} item{'s' if added != 1 else ''} to your shopping list"
